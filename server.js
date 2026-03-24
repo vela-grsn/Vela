@@ -10,6 +10,8 @@
 // ============================================================
 
 const express = require('express');
+const path = require('path');
+const fs = require('fs');
 const { Pool } = require('pg');
 const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
@@ -546,7 +548,20 @@ app.patch('/api/admin/users/:id/plan', auth, adminOnly, async (req, res) => {
 // HEALTH CHECK
 // ============================================================
 app.get('/health', (req, res) => res.json({ status: 'ok', app: 'VELA', version: '1.0.0', powered_by: 'Grassion' }));
-app.get('/', (req, res) => res.json({ app: 'VELA Backend', tagline: 'Run your whole life.', status: 'running' }));
+
+// Serve the VELA web app HTML if it exists in the same directory
+app.get('/', (req, res) => {
+  const htmlPath = path.join(__dirname, 'vela-app-final.html');
+  if (fs.existsSync(htmlPath)) {
+    res.sendFile(htmlPath);
+  } else {
+    res.json({ app: 'VELA Backend', tagline: 'Run Your Life.', status: 'running',
+      note: 'Upload vela-app-final.html to this directory to serve the app here' });
+  }
+});
+
+// Serve any other static files
+app.use(express.static(__dirname));
 
 // ============================================================
 // START SERVER
