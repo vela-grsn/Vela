@@ -1,6 +1,5 @@
 // ============================================================
-// VELA — Backend Server (Railway / Node.js)
-// Serves the frontend HTML + handles Razorpay webhook verification
+// VELA — Complete Production Backend (Railway / Node.js)
 // ============================================================
 
 const express = require('express');
@@ -11,185 +10,653 @@ const { createClient } = require('@supabase/supabase-js');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// ============================================================
-// ENVIRONMENT VARIABLES (set in Railway dashboard)
-// SUPABASE_URL, SUPABASE_ANON_KEY, SUPABASE_SERVICE_KEY
-// RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET
-// NODE_ENV
-// ============================================================
+const SUPABASE_URL        = process.env.SUPABASE_URL        || 'https://rhvwtvzaujxmerqkhdlv.supabase.co';
+const SUPABASE_ANON_KEY   = process.env.SUPABASE_ANON_KEY   || '';
+const SUPABASE_SERVICE_KEY= process.env.SUPABASE_SERVICE_KEY|| '';
+const RAZORPAY_KEY_ID     = process.env.RAZORPAY_KEY_ID     || '';
+const RAZORPAY_KEY_SECRET = process.env.RAZORPAY_KEY_SECRET || '';
+const RAZORPAY_WEBHOOK_SECRET = process.env.RAZORPAY_WEBHOOK_SECRET || '';
+const APP_URL             = process.env.APP_URL             || 'https://vela.grassion.com';
+const NODE_ENV            = process.env.NODE_ENV            || 'development';
 
-const SUPABASE_URL = process.env.SUPABASE_URL || 'https://rhvwtvzaujxmerqkhdlv.supabase.co';
-const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY;
-const RAZORPAY_KEY_ID = process.env.RAZORPAY_KEY_ID;
-const RAZORPAY_KEY_SECRET = process.env.RAZORPAY_KEY_SECRET;
-
-// Supabase admin client (uses service role — never exposed to frontend)
+const supabaseAnon  = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 const supabaseAdmin = SUPABASE_SERVICE_KEY
-  ? createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY)
+  ? createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY, { auth: { autoRefreshToken: false, persistSession: false } })
   : null;
 
 // ============================================================
 // MIDDLEWARE
 // ============================================================
-app.use(express.json());
+app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true }));
+app.use(express.static(path.join(__dirname, 'public')));
 
-// Security headers
+app.use((req, res, next) => {
+  const allowed = [APP_URL, 'http://localhost:3000', 'https://vela.grassion.com'];
+  const origin = req.headers.origin;
+  if (allowed.includes(origin)) res.setHeader('Access-Control-Allow-Origin', origin);
+  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,PATCH,DELETE,OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, apikey');
+  res.setHeader('Access-Control-Allow-Credentials', 'true');
+  if (req.method === 'OPTIONS') return res.sendStatus(200);
+  next();
+});
+
 app.use((req, res, next) => {
   res.setHeader('X-Content-Type-Options', 'nosniff');
   res.setHeader('X-Frame-Options', 'SAMEORIGIN');
-  res.setHeader('X-XSS-Protection', '1; mode=block');
   next();
+});
+
+app.use((req, res, next) => {
+  const start = Date.now();
+  res.on('finish', () => console.log(`[${new Date().toISOString()}] ${req.method} ${req.path} → ${res.statusCode} (${Date.now()-start}ms)`));
+  next();
+});
+
+async function requireAuth(req, res, next) {
+  const token = req.headers.authorization?.replace('Bearer ', '');
+  if (!token) return res.status(401).json({ error: 'No token provided' });
+  const { data: { user }, error } = await supabaseAnon.auth.getUser(token);
+  if (error || !user) return res.status(401).json({ error: 'Invalid token' });
+  req.user = user;
+  next();
+}
+
+async function requireAdmin(req, res, next) {
+  const token = req.headers.authorization?.replace('Bearer ', '');
+  if (!token) return res.status(401).json({ error: 'No token' });
+  const { data: { user }, error } = await supabaseAnon.auth.getUser(token);
+  if (error || !user) return res.status(401).json({ error: 'Invalid token' });
+  if (!supabaseAdmin) return res.status(503).json({ error: 'Admin not configured' });
+  const { data: profile } = await supabaseAdmin.from('profiles').select('role').eq('id', user.id).single();
+  if (!profile || !['admin','super_admin'].includes(profile.role)) return res.status(403).json({ error: 'Admin access required' });
+  req.user = user;
+  next();
+}
+
+// ============================================================
+// HEALTH
+// ============================================================
+app.get('/health', (req, res) => {
+  res.json({ status: 'ok', app: 'VELA', version: '2.0.0', env: NODE_ENV, timestamp: new Date().toISOString(), supabase: !!SUPABASE_SERVICE_KEY, razorpay: !!RAZORPAY_KEY_ID });
+});
+
+// ============================================================
+// AUTH
+// ============================================================
+app.post('/api/auth/signup', async (req, res) => {
+  try {
+    const { email, password, full_name } = req.body;
+    if (!email || !password || !full_name) return res.status(400).json({ error: 'All fields required' });
+    if (password.length < 8) return res.status(400).json({ error: 'Password must be at least 8 characters' });
+
+    const { data, error } = await supabaseAnon.auth.signUp({
+      email: email.trim().toLowerCase(),
+      password,
+      options: {
+        data: { full_name: full_name.trim() },
+        emailRedirectTo: `${APP_URL}/`
+      }
+    });
+
+    if (error) return res.status(400).json({ error: error.message });
+    if (data.user && data.user.identities?.length === 0) return res.status(400).json({ error: 'Email already registered. Please sign in.' });
+
+    if (data.user && supabaseAdmin) {
+      await supabaseAdmin.from('profiles').upsert({
+        id: data.user.id, full_name: full_name.trim(), email: email.trim().toLowerCase(), plan: 'free', role: 'user', created_at: new Date().toISOString()
+      }, { onConflict: 'id' });
+    }
+
+    res.json({ success: true, message: 'Account created! Check your email to verify your account before signing in.', needs_verification: true });
+  } catch (err) {
+    console.error('[Signup]', err);
+    res.status(500).json({ error: 'Server error during signup' });
+  }
+});
+
+app.post('/api/auth/signin', async (req, res) => {
+  try {
+    const { email, password } = req.body;
+    if (!email || !password) return res.status(400).json({ error: 'Email and password required' });
+
+    const { data, error } = await supabaseAnon.auth.signInWithPassword({ email: email.trim().toLowerCase(), password });
+
+    if (error) {
+      if (error.message.includes('Email not confirmed')) {
+        return res.status(401).json({ error: 'Please verify your email first. Check your inbox.', code: 'EMAIL_NOT_CONFIRMED' });
+      }
+      return res.status(401).json({ error: error.message });
+    }
+
+    let profile = null;
+    if (supabaseAdmin) {
+      const { data: p } = await supabaseAdmin.from('profiles').select('*').eq('id', data.user.id).single();
+      if (!p) {
+        const { data: newP } = await supabaseAdmin.from('profiles').insert({ id: data.user.id, full_name: data.user.user_metadata?.full_name || 'User', email: data.user.email, plan: 'free', role: 'user' }).select().single();
+        profile = newP;
+      } else {
+        profile = p;
+      }
+    }
+
+    res.json({ success: true, session: data.session, user: data.user, profile });
+  } catch (err) {
+    console.error('[Signin]', err);
+    res.status(500).json({ error: 'Server error during signin' });
+  }
+});
+
+app.post('/api/auth/resend-verification', async (req, res) => {
+  try {
+    const { email } = req.body;
+    if (!email) return res.status(400).json({ error: 'Email required' });
+    const { error } = await supabaseAnon.auth.resend({ type: 'signup', email: email.trim().toLowerCase(), options: { emailRedirectTo: `${APP_URL}/` } });
+    if (error) return res.status(400).json({ error: error.message });
+    res.json({ success: true, message: 'Verification email sent!' });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to resend email' });
+  }
+});
+
+app.post('/api/auth/reset-password', async (req, res) => {
+  try {
+    const { email } = req.body;
+    if (!email) return res.status(400).json({ error: 'Email required' });
+    const { error } = await supabaseAnon.auth.resetPasswordForEmail(email.trim().toLowerCase(), { redirectTo: `${APP_URL}/` });
+    if (error) return res.status(400).json({ error: error.message });
+    res.json({ success: true, message: 'Password reset email sent!' });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to send reset email' });
+  }
+});
+
+// ============================================================
+// PROFILE
+// ============================================================
+app.get('/api/user/profile', requireAuth, async (req, res) => {
+  try {
+    if (!supabaseAdmin) return res.status(503).json({ error: 'Admin not configured' });
+    const { data, error } = await supabaseAdmin.from('profiles').select('*').eq('id', req.user.id).single();
+    if (error) return res.status(404).json({ error: 'Profile not found' });
+    res.json({ profile: data });
+  } catch (err) { res.status(500).json({ error: 'Failed to fetch profile' }); }
+});
+
+app.patch('/api/user/profile', requireAuth, async (req, res) => {
+  try {
+    if (!supabaseAdmin) return res.status(503).json({ error: 'Admin not configured' });
+    const updates = {};
+    if (req.body.full_name) updates.full_name = req.body.full_name.trim();
+    updates.updated_at = new Date().toISOString();
+    const { data, error } = await supabaseAdmin.from('profiles').update(updates).eq('id', req.user.id).select().single();
+    if (error) return res.status(400).json({ error: error.message });
+    res.json({ success: true, profile: data });
+  } catch (err) { res.status(500).json({ error: 'Failed to update profile' }); }
+});
+
+// ============================================================
+// TASKS
+// ============================================================
+app.get('/api/tasks', requireAuth, async (req, res) => {
+  try {
+    if (!supabaseAdmin) return res.status(503).json({ error: 'Admin not configured' });
+    const { data, error } = await supabaseAdmin.from('tasks').select('*').eq('user_id', req.user.id).order('created_at', { ascending: false });
+    if (error) return res.status(400).json({ error: error.message });
+    res.json({ tasks: data });
+  } catch (err) { res.status(500).json({ error: 'Failed to fetch tasks' }); }
+});
+
+app.post('/api/tasks', requireAuth, async (req, res) => {
+  try {
+    if (!supabaseAdmin) return res.status(503).json({ error: 'Admin not configured' });
+    const { title, description, priority, due_date, category } = req.body;
+    if (!title) return res.status(400).json({ error: 'Title required' });
+    const { data, error } = await supabaseAdmin.from('tasks').insert({ user_id: req.user.id, title, description, priority: priority || 'medium', due_date: due_date || null, category: category || 'personal', completed: false }).select().single();
+    if (error) return res.status(400).json({ error: error.message });
+    res.json({ success: true, task: data });
+  } catch (err) { res.status(500).json({ error: 'Failed to create task' }); }
+});
+
+app.patch('/api/tasks/:id', requireAuth, async (req, res) => {
+  try {
+    if (!supabaseAdmin) return res.status(503).json({ error: 'Admin not configured' });
+    const updates = { ...req.body };
+    delete updates.user_id;
+    const { data, error } = await supabaseAdmin.from('tasks').update(updates).eq('id', req.params.id).eq('user_id', req.user.id).select().single();
+    if (error) return res.status(400).json({ error: error.message });
+    res.json({ success: true, task: data });
+  } catch (err) { res.status(500).json({ error: 'Failed to update task' }); }
+});
+
+app.delete('/api/tasks/:id', requireAuth, async (req, res) => {
+  try {
+    if (!supabaseAdmin) return res.status(503).json({ error: 'Admin not configured' });
+    await supabaseAdmin.from('tasks').delete().eq('id', req.params.id).eq('user_id', req.user.id);
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: 'Failed to delete task' }); }
+});
+
+// ============================================================
+// TRANSACTIONS
+// ============================================================
+app.get('/api/transactions', requireAuth, async (req, res) => {
+  try {
+    if (!supabaseAdmin) return res.status(503).json({ error: 'Admin not configured' });
+    const { data, error } = await supabaseAdmin.from('transactions').select('*').eq('user_id', req.user.id).order('date', { ascending: false });
+    if (error) return res.status(400).json({ error: error.message });
+    res.json({ transactions: data });
+  } catch (err) { res.status(500).json({ error: 'Failed to fetch transactions' }); }
+});
+
+app.post('/api/transactions', requireAuth, async (req, res) => {
+  try {
+    if (!supabaseAdmin) return res.status(503).json({ error: 'Admin not configured' });
+    const { type, description, amount, date, category, status } = req.body;
+    if (!description || !amount) return res.status(400).json({ error: 'Description and amount required' });
+    const { data, error } = await supabaseAdmin.from('transactions').insert({ user_id: req.user.id, type: type || 'expense', description, amount: parseFloat(amount), date: date || new Date().toISOString().split('T')[0], category: category || 'other', status: status || 'paid' }).select().single();
+    if (error) return res.status(400).json({ error: error.message });
+    res.json({ success: true, transaction: data });
+  } catch (err) { res.status(500).json({ error: 'Failed to create transaction' }); }
+});
+
+app.delete('/api/transactions/:id', requireAuth, async (req, res) => {
+  try {
+    if (!supabaseAdmin) return res.status(503).json({ error: 'Admin not configured' });
+    await supabaseAdmin.from('transactions').delete().eq('id', req.params.id).eq('user_id', req.user.id);
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: 'Failed to delete transaction' }); }
+});
+
+// ============================================================
+// FOODS
+// ============================================================
+app.get('/api/foods', requireAuth, async (req, res) => {
+  try {
+    if (!supabaseAdmin) return res.status(503).json({ error: 'Admin not configured' });
+    const date = req.query.date || new Date().toISOString().split('T')[0];
+    const { data, error } = await supabaseAdmin.from('foods').select('*').eq('user_id', req.user.id).eq('date', date);
+    if (error) return res.status(400).json({ error: error.message });
+    res.json({ foods: data });
+  } catch (err) { res.status(500).json({ error: 'Failed to fetch foods' }); }
+});
+
+app.post('/api/foods', requireAuth, async (req, res) => {
+  try {
+    if (!supabaseAdmin) return res.status(503).json({ error: 'Admin not configured' });
+    const { name, meal, calories, protein, carbs, fat } = req.body;
+    if (!name) return res.status(400).json({ error: 'Food name required' });
+    const { data, error } = await supabaseAdmin.from('foods').insert({ user_id: req.user.id, name, meal: meal || 'breakfast', calories: parseInt(calories)||0, protein: parseInt(protein)||0, carbs: parseInt(carbs)||0, fat: parseInt(fat)||0, date: new Date().toISOString().split('T')[0] }).select().single();
+    if (error) return res.status(400).json({ error: error.message });
+    res.json({ success: true, food: data });
+  } catch (err) { res.status(500).json({ error: 'Failed to add food' }); }
+});
+
+app.delete('/api/foods/:id', requireAuth, async (req, res) => {
+  try {
+    if (!supabaseAdmin) return res.status(503).json({ error: 'Admin not configured' });
+    await supabaseAdmin.from('foods').delete().eq('id', req.params.id).eq('user_id', req.user.id);
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: 'Failed to delete food' }); }
+});
+
+// ============================================================
+// HABITS
+// ============================================================
+app.get('/api/habits', requireAuth, async (req, res) => {
+  try {
+    if (!supabaseAdmin) return res.status(503).json({ error: 'Admin not configured' });
+    const today = new Date().toISOString().split('T')[0];
+    const [habitsRes, checksRes] = await Promise.all([
+      supabaseAdmin.from('habits').select('*').eq('user_id', req.user.id),
+      supabaseAdmin.from('habit_checks').select('habit_id').eq('user_id', req.user.id).eq('check_date', today)
+    ]);
+    res.json({ habits: habitsRes.data || [], checks: checksRes.data || [] });
+  } catch (err) { res.status(500).json({ error: 'Failed to fetch habits' }); }
+});
+
+app.post('/api/habits', requireAuth, async (req, res) => {
+  try {
+    if (!supabaseAdmin) return res.status(503).json({ error: 'Admin not configured' });
+    const { name, icon, frequency } = req.body;
+    if (!name) return res.status(400).json({ error: 'Habit name required' });
+    const { data, error } = await supabaseAdmin.from('habits').insert({ user_id: req.user.id, name, icon: icon || '⭐', frequency: frequency || 'daily', streak: 0 }).select().single();
+    if (error) return res.status(400).json({ error: error.message });
+    res.json({ success: true, habit: data });
+  } catch (err) { res.status(500).json({ error: 'Failed to create habit' }); }
+});
+
+app.post('/api/habits/:id/check', requireAuth, async (req, res) => {
+  try {
+    if (!supabaseAdmin) return res.status(503).json({ error: 'Admin not configured' });
+    const today = new Date().toISOString().split('T')[0];
+    const { done } = req.body;
+    if (done) {
+      await supabaseAdmin.from('habit_checks').upsert({ user_id: req.user.id, habit_id: req.params.id, check_date: today }, { onConflict: 'user_id,habit_id,check_date' });
+      const { data: h } = await supabaseAdmin.from('habits').select('streak').eq('id', req.params.id).single();
+      await supabaseAdmin.from('habits').update({ streak: (h?.streak||0)+1 }).eq('id', req.params.id);
+    } else {
+      await supabaseAdmin.from('habit_checks').delete().eq('habit_id', req.params.id).eq('user_id', req.user.id).eq('check_date', today);
+    }
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: 'Failed to update habit' }); }
+});
+
+app.delete('/api/habits/:id', requireAuth, async (req, res) => {
+  try {
+    if (!supabaseAdmin) return res.status(503).json({ error: 'Admin not configured' });
+    await Promise.all([supabaseAdmin.from('habit_checks').delete().eq('habit_id', req.params.id).eq('user_id', req.user.id), supabaseAdmin.from('habits').delete().eq('id', req.params.id).eq('user_id', req.user.id)]);
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: 'Failed to delete habit' }); }
+});
+
+// ============================================================
+// EVENTS
+// ============================================================
+app.get('/api/events', requireAuth, async (req, res) => {
+  try {
+    if (!supabaseAdmin) return res.status(503).json({ error: 'Admin not configured' });
+    const { data, error } = await supabaseAdmin.from('events').select('*').eq('user_id', req.user.id).order('event_date', { ascending: true });
+    if (error) return res.status(400).json({ error: error.message });
+    res.json({ events: data });
+  } catch (err) { res.status(500).json({ error: 'Failed to fetch events' }); }
+});
+
+app.post('/api/events', requireAuth, async (req, res) => {
+  try {
+    if (!supabaseAdmin) return res.status(503).json({ error: 'Admin not configured' });
+    const { title, event_date, event_time, note } = req.body;
+    if (!title || !event_date) return res.status(400).json({ error: 'Title and date required' });
+    const { data, error } = await supabaseAdmin.from('events').insert({ user_id: req.user.id, title, event_date, event_time: event_time || null, note: note || '' }).select().single();
+    if (error) return res.status(400).json({ error: error.message });
+    res.json({ success: true, event: data });
+  } catch (err) { res.status(500).json({ error: 'Failed to create event' }); }
+});
+
+app.delete('/api/events/:id', requireAuth, async (req, res) => {
+  try {
+    if (!supabaseAdmin) return res.status(503).json({ error: 'Admin not configured' });
+    await supabaseAdmin.from('events').delete().eq('id', req.params.id).eq('user_id', req.user.id);
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: 'Failed to delete event' }); }
+});
+
+// ============================================================
+// TRIPS
+// ============================================================
+app.get('/api/trips', requireAuth, async (req, res) => {
+  try {
+    if (!supabaseAdmin) return res.status(503).json({ error: 'Admin not configured' });
+    const { data, error } = await supabaseAdmin.from('trips').select('*').eq('user_id', req.user.id);
+    if (error) return res.status(400).json({ error: error.message });
+    res.json({ trips: data });
+  } catch (err) { res.status(500).json({ error: 'Failed to fetch trips' }); }
+});
+
+app.post('/api/trips', requireAuth, async (req, res) => {
+  try {
+    if (!supabaseAdmin) return res.status(503).json({ error: 'Admin not configured' });
+    const { destination, from_date, to_date, budget } = req.body;
+    if (!destination) return res.status(400).json({ error: 'Destination required' });
+    const { data, error } = await supabaseAdmin.from('trips').insert({ user_id: req.user.id, destination, from_date: from_date || null, to_date: to_date || null, budget: parseFloat(budget)||null }).select().single();
+    if (error) return res.status(400).json({ error: error.message });
+    res.json({ success: true, trip: data });
+  } catch (err) { res.status(500).json({ error: 'Failed to create trip' }); }
+});
+
+app.delete('/api/trips/:id', requireAuth, async (req, res) => {
+  try {
+    if (!supabaseAdmin) return res.status(503).json({ error: 'Admin not configured' });
+    await supabaseAdmin.from('trips').delete().eq('id', req.params.id).eq('user_id', req.user.id);
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: 'Failed to delete trip' }); }
+});
+
+// ============================================================
+// VAULT
+// ============================================================
+app.get('/api/vault', requireAuth, async (req, res) => {
+  try {
+    if (!supabaseAdmin) return res.status(503).json({ error: 'Admin not configured' });
+    const { data, error } = await supabaseAdmin.from('vault').select('*').eq('user_id', req.user.id);
+    if (error) return res.status(400).json({ error: error.message });
+    res.json({ vault: data });
+  } catch (err) { res.status(500).json({ error: 'Failed to fetch vault' }); }
+});
+
+app.post('/api/vault', requireAuth, async (req, res) => {
+  try {
+    if (!supabaseAdmin) return res.status(503).json({ error: 'Admin not configured' });
+    const { site_name, username, password, url, notes } = req.body;
+    if (!site_name || !password) return res.status(400).json({ error: 'Site name and password required' });
+    const { data, error } = await supabaseAdmin.from('vault').insert({ user_id: req.user.id, site_name, username: username||'', password: Buffer.from(password).toString('base64'), url: url||'', notes: notes||'' }).select().single();
+    if (error) return res.status(400).json({ error: error.message });
+    res.json({ success: true, vault_item: data });
+  } catch (err) { res.status(500).json({ error: 'Failed to save vault item' }); }
+});
+
+app.delete('/api/vault/:id', requireAuth, async (req, res) => {
+  try {
+    if (!supabaseAdmin) return res.status(503).json({ error: 'Admin not configured' });
+    await supabaseAdmin.from('vault').delete().eq('id', req.params.id).eq('user_id', req.user.id);
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: 'Failed to delete vault item' }); }
+});
+
+// ============================================================
+// POSTS
+// ============================================================
+app.get('/api/posts', requireAuth, async (req, res) => {
+  try {
+    if (!supabaseAdmin) return res.status(503).json({ error: 'Admin not configured' });
+    const { data, error } = await supabaseAdmin.from('posts').select('*').eq('user_id', req.user.id).order('created_at', { ascending: false });
+    if (error) return res.status(400).json({ error: error.message });
+    res.json({ posts: data });
+  } catch (err) { res.status(500).json({ error: 'Failed to fetch posts' }); }
+});
+
+app.post('/api/posts', requireAuth, async (req, res) => {
+  try {
+    if (!supabaseAdmin) return res.status(503).json({ error: 'Admin not configured' });
+    const { platform, content, scheduled_at } = req.body;
+    if (!content) return res.status(400).json({ error: 'Content required' });
+    const { data, error } = await supabaseAdmin.from('posts').insert({ user_id: req.user.id, platform: platform||'twitter', content, scheduled_at: scheduled_at||null, status: scheduled_at ? 'scheduled' : 'draft' }).select().single();
+    if (error) return res.status(400).json({ error: error.message });
+    res.json({ success: true, post: data });
+  } catch (err) { res.status(500).json({ error: 'Failed to create post' }); }
+});
+
+app.delete('/api/posts/:id', requireAuth, async (req, res) => {
+  try {
+    if (!supabaseAdmin) return res.status(503).json({ error: 'Admin not configured' });
+    await supabaseAdmin.from('posts').delete().eq('id', req.params.id).eq('user_id', req.user.id);
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: 'Failed to delete post' }); }
+});
+
+// ============================================================
+// EXERCISES
+// ============================================================
+app.get('/api/exercises', requireAuth, async (req, res) => {
+  try {
+    if (!supabaseAdmin) return res.status(503).json({ error: 'Admin not configured' });
+    const { data, error } = await supabaseAdmin.from('exercises').select('*').eq('user_id', req.user.id);
+    if (error) return res.status(400).json({ error: error.message });
+    res.json({ exercises: data });
+  } catch (err) { res.status(500).json({ error: 'Failed to fetch exercises' }); }
+});
+
+app.post('/api/exercises', requireAuth, async (req, res) => {
+  try {
+    if (!supabaseAdmin) return res.status(503).json({ error: 'Admin not configured' });
+    const { name, sets, reps_or_duration, category } = req.body;
+    if (!name) return res.status(400).json({ error: 'Exercise name required' });
+    const { data, error } = await supabaseAdmin.from('exercises').insert({ user_id: req.user.id, name, sets: sets||'3', reps_or_duration: reps_or_duration||'10', category: category||'strength' }).select().single();
+    if (error) return res.status(400).json({ error: error.message });
+    res.json({ success: true, exercise: data });
+  } catch (err) { res.status(500).json({ error: 'Failed to add exercise' }); }
+});
+
+app.delete('/api/exercises/:id', requireAuth, async (req, res) => {
+  try {
+    if (!supabaseAdmin) return res.status(503).json({ error: 'Admin not configured' });
+    await supabaseAdmin.from('exercises').delete().eq('id', req.params.id).eq('user_id', req.user.id);
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: 'Failed to delete exercise' }); }
+});
+
+// ============================================================
+// RAZORPAY
+// ============================================================
+app.post('/api/payment/create-order', requireAuth, async (req, res) => {
+  try {
+    if (!RAZORPAY_KEY_ID || !RAZORPAY_KEY_SECRET) return res.status(503).json({ error: 'Payment not configured' });
+    const { plan } = req.body;
+    const prices = { pro: 19900, premium: 49900 };
+    const amount = prices[plan];
+    if (!amount) return res.status(400).json({ error: 'Invalid plan' });
+
+    const Razorpay = require('razorpay');
+    const rzp = new Razorpay({ key_id: RAZORPAY_KEY_ID, key_secret: RAZORPAY_KEY_SECRET });
+    const order = await rzp.orders.create({ amount, currency: 'INR', receipt: `vela_${plan}_${Date.now()}`, notes: { user_id: req.user.id, plan, user_email: req.user.email } });
+    res.json({ success: true, order, key_id: RAZORPAY_KEY_ID });
+  } catch (err) {
+    console.error('[Payment Order]', err);
+    res.status(500).json({ error: 'Failed to create payment order' });
+  }
+});
+
+app.post('/api/payment/verify', requireAuth, async (req, res) => {
+  try {
+    const { razorpay_order_id, razorpay_payment_id, razorpay_signature, plan } = req.body;
+    if (!RAZORPAY_KEY_SECRET) return res.status(503).json({ error: 'Payment not configured' });
+
+    const expectedSig = crypto.createHmac('sha256', RAZORPAY_KEY_SECRET).update(`${razorpay_order_id}|${razorpay_payment_id}`).digest('hex');
+    if (expectedSig !== razorpay_signature) return res.status(400).json({ error: 'Payment verification failed' });
+
+    if (supabaseAdmin) {
+      await supabaseAdmin.from('profiles').update({ plan, razorpay_payment_id, updated_at: new Date().toISOString() }).eq('id', req.user.id);
+      await supabaseAdmin.from('transactions').insert({ user_id: req.user.id, type: 'expense', description: `VELA ${plan} subscription`, amount: plan === 'pro' ? 199 : 499, date: new Date().toISOString().split('T')[0], category: 'subscription', status: 'paid' });
+    }
+    res.json({ success: true, plan, message: `Upgraded to ${plan}!` });
+  } catch (err) {
+    console.error('[Payment Verify]', err);
+    res.status(500).json({ error: 'Payment verification error' });
+  }
+});
+
+app.post('/webhook/razorpay', express.raw({ type: 'application/json' }), async (req, res) => {
+  try {
+    if (RAZORPAY_WEBHOOK_SECRET) {
+      const sig = req.headers['x-razorpay-signature'];
+      const expected = crypto.createHmac('sha256', RAZORPAY_WEBHOOK_SECRET).update(req.body).digest('hex');
+      if (sig !== expected) return res.status(400).json({ error: 'Invalid signature' });
+    }
+    const event = JSON.parse(req.body);
+    if (event.event === 'payment.captured' && supabaseAdmin) {
+      const p = event.payload.payment.entity;
+      if (p.notes?.user_id && p.notes?.plan) {
+        await supabaseAdmin.from('profiles').update({ plan: p.notes.plan, razorpay_payment_id: p.id }).eq('id', p.notes.user_id);
+      }
+    }
+    res.json({ status: 'ok' });
+  } catch (err) {
+    console.error('[Webhook]', err);
+    res.status(500).json({ error: 'Webhook error' });
+  }
+});
+
+// ============================================================
+// ADMIN
+// ============================================================
+app.get('/api/admin/stats', requireAdmin, async (req, res) => {
+  try {
+    const { data: users } = await supabaseAdmin.from('profiles').select('*').order('created_at', { ascending: false });
+    const all = users || [];
+    const pro = all.filter(u => u.plan === 'pro').length;
+    const premium = all.filter(u => u.plan === 'premium').length;
+    const [tasks, txns, habits] = await Promise.all([
+      supabaseAdmin.from('tasks').select('id', { count: 'exact', head: true }),
+      supabaseAdmin.from('transactions').select('id', { count: 'exact', head: true }),
+      supabaseAdmin.from('habits').select('id', { count: 'exact', head: true }),
+    ]);
+    res.json({ users: all, stats: { total_users: all.length, pro_users: pro, premium_users: premium, free_users: all.length-pro-premium, estimated_revenue: (pro*199)+(premium*499), total_tasks: tasks.count||0, total_transactions: txns.count||0, total_habits: habits.count||0 } });
+  } catch (err) { res.status(500).json({ error: 'Failed to fetch admin stats' }); }
+});
+
+app.post('/api/admin/grant-plan', requireAdmin, async (req, res) => {
+  try {
+    const { email, plan } = req.body;
+    if (!email || !plan) return res.status(400).json({ error: 'Email and plan required' });
+    const { data, error } = await supabaseAdmin.from('profiles').update({ plan, updated_at: new Date().toISOString() }).eq('email', email.toLowerCase()).select();
+    if (error || !data?.length) return res.status(404).json({ error: 'User not found' });
+    res.json({ success: true, message: `Plan ${plan} granted to ${email}` });
+  } catch (err) { res.status(500).json({ error: 'Failed to grant plan' }); }
+});
+
+app.post('/api/admin/notify', requireAdmin, async (req, res) => {
+  try {
+    const { title, body, target_plan } = req.body;
+    if (!title || !body) return res.status(400).json({ error: 'Title and body required' });
+    await supabaseAdmin.from('notifications_queue').insert({ title, body, type: 'broadcast', target_plan: target_plan||'all', status: 'pending' });
+    res.json({ success: true, message: `Notification queued for ${target_plan||'all'} users` });
+  } catch (err) { res.status(500).json({ error: 'Failed to queue notification' }); }
+});
+
+app.delete('/api/admin/users/:id', requireAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    await Promise.all([
+      supabaseAdmin.from('tasks').delete().eq('user_id', id),
+      supabaseAdmin.from('transactions').delete().eq('user_id', id),
+      supabaseAdmin.from('foods').delete().eq('user_id', id),
+      supabaseAdmin.from('habits').delete().eq('user_id', id),
+      supabaseAdmin.from('habit_checks').delete().eq('user_id', id),
+      supabaseAdmin.from('events').delete().eq('user_id', id),
+      supabaseAdmin.from('trips').delete().eq('user_id', id),
+      supabaseAdmin.from('vault').delete().eq('user_id', id),
+      supabaseAdmin.from('posts').delete().eq('user_id', id),
+      supabaseAdmin.from('exercises').delete().eq('user_id', id),
+      supabaseAdmin.from('profiles').delete().eq('id', id),
+    ]);
+    await supabaseAdmin.auth.admin.deleteUser(id);
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: 'Failed to delete user' }); }
+});
+
+// ============================================================
+// CONFIG
+// ============================================================
+app.get('/api/config', (req, res) => {
+  res.json({ razorpay_key_id: RAZORPAY_KEY_ID, app_url: APP_URL });
 });
 
 // ============================================================
 // SERVE FRONTEND
 // ============================================================
-app.get('/', (req, res) => {
+app.get('/', (req, res) => res.sendFile(path.join(__dirname, 'vela-app-final.html')));
+app.get('/admin', (req, res) => res.sendFile(path.join(__dirname, 'vela-app-final.html')));
+app.get('*', (req, res) => {
+  if (req.path.startsWith('/api/') || req.path.startsWith('/webhook/')) return res.status(404).json({ error: 'Not found' });
   res.sendFile(path.join(__dirname, 'vela-app-final.html'));
 });
 
-// Catch all for SPA — also serve the HTML
-app.get('/app', (req, res) => {
-  res.sendFile(path.join(__dirname, 'vela-app-final.html'));
-});
-
 // ============================================================
-// HEALTH CHECK
+// ERROR HANDLER
 // ============================================================
-app.get('/health', (req, res) => {
-  res.json({
-    status: 'ok',
-    app: 'VELA',
-    version: '1.0.0',
-    timestamp: new Date().toISOString(),
-    env: process.env.NODE_ENV || 'development'
-  });
-});
-
-// ============================================================
-// RAZORPAY WEBHOOK (Payment verification — server-side)
-// This is the secure way to verify payments beyond the client handler
-// ============================================================
-app.post('/webhook/razorpay', async (req, res) => {
-  try {
-    const signature = req.headers['x-razorpay-signature'];
-    const webhookSecret = process.env.RAZORPAY_WEBHOOK_SECRET;
-
-    if (!webhookSecret) {
-      // Webhook secret not configured — skip verification in dev
-      console.log('[Razorpay Webhook] No secret configured, skipping');
-      return res.json({ status: 'ok' });
-    }
-
-    // Verify signature
-    const expectedSig = crypto
-      .createHmac('sha256', webhookSecret)
-      .update(JSON.stringify(req.body))
-      .digest('hex');
-
-    if (signature !== expectedSig) {
-      console.error('[Razorpay Webhook] Invalid signature');
-      return res.status(400).json({ error: 'Invalid signature' });
-    }
-
-    const event = req.body;
-    console.log('[Razorpay Webhook] Event:', event.event);
-
-    // Handle payment capture event
-    if (event.event === 'payment.captured' && supabaseAdmin) {
-      const payment = event.payload.payment.entity;
-      const { notes } = payment;
-
-      if (notes?.user_id && notes?.plan) {
-        // Update user plan in Supabase via admin client
-        const { error } = await supabaseAdmin
-          .from('profiles')
-          .update({
-            plan: notes.plan,
-            razorpay_payment_id: payment.id
-          })
-          .eq('id', notes.user_id);
-
-        if (error) {
-          console.error('[Razorpay Webhook] Supabase update error:', error);
-        } else {
-          console.log(`[Razorpay Webhook] Plan updated: ${notes.user_id} → ${notes.plan}`);
-        }
-      }
-    }
-
-    res.json({ status: 'ok' });
-  } catch (err) {
-    console.error('[Razorpay Webhook] Error:', err);
-    res.status(500).json({ error: 'Internal error' });
-  }
-});
-
-// ============================================================
-// API: Get Razorpay key (expose public key safely)
-// ============================================================
-app.get('/api/config', (req, res) => {
-  res.json({
-    razorpay_key_id: RAZORPAY_KEY_ID || '',
-    app: 'VELA'
-  });
-});
-
-// ============================================================
-// API: Admin — Broadcast notification
-// Requires service role, called from admin panel
-// ============================================================
-app.post('/api/admin/notify', async (req, res) => {
-  try {
-    if (!supabaseAdmin) return res.status(503).json({ error: 'Admin client unavailable' });
-
-    const { title, body, target_plan } = req.body;
-    if (!title || !body) return res.status(400).json({ error: 'Title and body required' });
-
-    const { error } = await supabaseAdmin
-      .from('notifications_queue')
-      .insert({
-        title,
-        body,
-        type: 'broadcast',
-        target_plan: target_plan || 'all',
-        status: 'pending'
-      });
-
-    if (error) throw error;
-    res.json({ status: 'queued' });
-  } catch (err) {
-    console.error('[Notify API] Error:', err);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// ============================================================
-// 404
-// ============================================================
-app.use((req, res) => {
-  // For any unmatched route, serve the app (PWA support)
-  res.sendFile(path.join(__dirname, 'vela-app-final.html'));
+app.use((err, req, res, next) => {
+  console.error('[Error]', err);
+  res.status(500).json({ error: 'Internal server error' });
 });
 
 // ============================================================
 // START
 // ============================================================
 app.listen(PORT, '0.0.0.0', () => {
-  console.log(`
-  ██╗   ██╗███████╗██╗      █████╗ 
-  ██║   ██║██╔════╝██║     ██╔══██╗
-  ██║   ██║█████╗  ██║     ███████║
-  ╚██╗ ██╔╝██╔══╝  ██║     ██╔══██║
-   ╚████╔╝ ███████╗███████╗██║  ██║
-    ╚═══╝  ╚══════╝╚══════╝╚═╝  ╚═╝
-  Run Your Life.
-  
-  Server running on port ${PORT}
-  Environment: ${process.env.NODE_ENV || 'development'}
-  Supabase: ${SUPABASE_URL}
-  `);
+  console.log(`VELA v2.0 running on port ${PORT} | ${NODE_ENV}`);
+  console.log(`Supabase: ${SUPABASE_URL} | Admin: ${!!SUPABASE_SERVICE_KEY}`);
+  console.log(`Razorpay: ${!!RAZORPAY_KEY_ID} | App: ${APP_URL}`);
 });
 
 module.exports = app;
