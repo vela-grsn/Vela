@@ -1,16 +1,195 @@
-{
-  "name": "vela",
-  "version": "1.0.0",
-  "main": "server.js",
-  "scripts": { "start": "node server.js" },
-  "dependencies": {
-    "express": "^4.18.0",
-    "pg": "^8.11.0",
-    "jsonwebtoken": "^9.0.0",
-    "bcryptjs": "^2.4.3",
-    "cors": "^2.8.5",
-    "dotenv": "^16.0.0",
-    "node-cron": "^3.0.0",
-    "uuid": "^9.0.0"
+// ============================================================
+// VELA — Backend Server (Railway / Node.js)
+// Serves the frontend HTML + handles Razorpay webhook verification
+// ============================================================
+
+const express = require('express');
+const path = require('path');
+const crypto = require('crypto');
+const { createClient } = require('@supabase/supabase-js');
+
+const app = express();
+const PORT = process.env.PORT || 3000;
+
+// ============================================================
+// ENVIRONMENT VARIABLES (set in Railway dashboard)
+// SUPABASE_URL, SUPABASE_ANON_KEY, SUPABASE_SERVICE_KEY
+// RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET
+// NODE_ENV
+// ============================================================
+
+const SUPABASE_URL = process.env.SUPABASE_URL || 'https://rhvwtvzaujxmerqkhdlv.supabase.co';
+const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY;
+const RAZORPAY_KEY_ID = process.env.RAZORPAY_KEY_ID;
+const RAZORPAY_KEY_SECRET = process.env.RAZORPAY_KEY_SECRET;
+
+// Supabase admin client (uses service role — never exposed to frontend)
+const supabaseAdmin = SUPABASE_SERVICE_KEY
+  ? createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY)
+  : null;
+
+// ============================================================
+// MIDDLEWARE
+// ============================================================
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
+
+// Security headers
+app.use((req, res, next) => {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-Frame-Options', 'SAMEORIGIN');
+  res.setHeader('X-XSS-Protection', '1; mode=block');
+  next();
+});
+
+// ============================================================
+// SERVE FRONTEND
+// ============================================================
+app.get('/', (req, res) => {
+  res.sendFile(path.join(__dirname, 'vela-app-final.html'));
+});
+
+// Catch all for SPA — also serve the HTML
+app.get('/app', (req, res) => {
+  res.sendFile(path.join(__dirname, 'vela-app-final.html'));
+});
+
+// ============================================================
+// HEALTH CHECK
+// ============================================================
+app.get('/health', (req, res) => {
+  res.json({
+    status: 'ok',
+    app: 'VELA',
+    version: '1.0.0',
+    timestamp: new Date().toISOString(),
+    env: process.env.NODE_ENV || 'development'
+  });
+});
+
+// ============================================================
+// RAZORPAY WEBHOOK (Payment verification — server-side)
+// This is the secure way to verify payments beyond the client handler
+// ============================================================
+app.post('/webhook/razorpay', async (req, res) => {
+  try {
+    const signature = req.headers['x-razorpay-signature'];
+    const webhookSecret = process.env.RAZORPAY_WEBHOOK_SECRET;
+
+    if (!webhookSecret) {
+      // Webhook secret not configured — skip verification in dev
+      console.log('[Razorpay Webhook] No secret configured, skipping');
+      return res.json({ status: 'ok' });
+    }
+
+    // Verify signature
+    const expectedSig = crypto
+      .createHmac('sha256', webhookSecret)
+      .update(JSON.stringify(req.body))
+      .digest('hex');
+
+    if (signature !== expectedSig) {
+      console.error('[Razorpay Webhook] Invalid signature');
+      return res.status(400).json({ error: 'Invalid signature' });
+    }
+
+    const event = req.body;
+    console.log('[Razorpay Webhook] Event:', event.event);
+
+    // Handle payment capture event
+    if (event.event === 'payment.captured' && supabaseAdmin) {
+      const payment = event.payload.payment.entity;
+      const { notes } = payment;
+
+      if (notes?.user_id && notes?.plan) {
+        // Update user plan in Supabase via admin client
+        const { error } = await supabaseAdmin
+          .from('profiles')
+          .update({
+            plan: notes.plan,
+            razorpay_payment_id: payment.id
+          })
+          .eq('id', notes.user_id);
+
+        if (error) {
+          console.error('[Razorpay Webhook] Supabase update error:', error);
+        } else {
+          console.log(`[Razorpay Webhook] Plan updated: ${notes.user_id} → ${notes.plan}`);
+        }
+      }
+    }
+
+    res.json({ status: 'ok' });
+  } catch (err) {
+    console.error('[Razorpay Webhook] Error:', err);
+    res.status(500).json({ error: 'Internal error' });
   }
-}
+});
+
+// ============================================================
+// API: Get Razorpay key (expose public key safely)
+// ============================================================
+app.get('/api/config', (req, res) => {
+  res.json({
+    razorpay_key_id: RAZORPAY_KEY_ID || '',
+    app: 'VELA'
+  });
+});
+
+// ============================================================
+// API: Admin — Broadcast notification
+// Requires service role, called from admin panel
+// ============================================================
+app.post('/api/admin/notify', async (req, res) => {
+  try {
+    if (!supabaseAdmin) return res.status(503).json({ error: 'Admin client unavailable' });
+
+    const { title, body, target_plan } = req.body;
+    if (!title || !body) return res.status(400).json({ error: 'Title and body required' });
+
+    const { error } = await supabaseAdmin
+      .from('notifications_queue')
+      .insert({
+        title,
+        body,
+        type: 'broadcast',
+        target_plan: target_plan || 'all',
+        status: 'pending'
+      });
+
+    if (error) throw error;
+    res.json({ status: 'queued' });
+  } catch (err) {
+    console.error('[Notify API] Error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ============================================================
+// 404
+// ============================================================
+app.use((req, res) => {
+  // For any unmatched route, serve the app (PWA support)
+  res.sendFile(path.join(__dirname, 'vela-app-final.html'));
+});
+
+// ============================================================
+// START
+// ============================================================
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`
+  ██╗   ██╗███████╗██╗      █████╗ 
+  ██║   ██║██╔════╝██║     ██╔══██╗
+  ██║   ██║█████╗  ██║     ███████║
+  ╚██╗ ██╔╝██╔══╝  ██║     ██╔══██║
+   ╚████╔╝ ███████╗███████╗██║  ██║
+    ╚═══╝  ╚══════╝╚══════╝╚═╝  ╚═╝
+  Run Your Life.
+  
+  Server running on port ${PORT}
+  Environment: ${process.env.NODE_ENV || 'development'}
+  Supabase: ${SUPABASE_URL}
+  `);
+});
+
+module.exports = app;
