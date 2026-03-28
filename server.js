@@ -1,576 +1,662 @@
 // ============================================================
-// VELA — Complete Backend Server
-// Run your whole life.
-// Powered by Grassion
-//
-// HOW TO USE:
-// 1. Upload this file to GitHub as: server.js
-// 2. Deploy repo on Railway
-// 3. Add env variables in Railway Variables tab
+// VELA — Complete Production Backend (Railway / Node.js)
 // ============================================================
 
 const express = require('express');
 const path = require('path');
-const fs = require('fs');
-const { Pool } = require('pg');
-const jwt = require('jsonwebtoken');
-const bcrypt = require('bcryptjs');
-const cron = require('node-cron');
-const cors = require('cors');
-const { v4: uuidv4 } = require('uuid');
-require('dotenv').config();
+const crypto = require('crypto');
+const { createClient } = require('@supabase/supabase-js');
 
 const app = express();
-app.use(cors({ origin: '*' }));
-app.use(express.json({ limit: '50mb' }));
+const PORT = process.env.PORT || 3000;
+
+const SUPABASE_URL        = process.env.SUPABASE_URL        || 'https://rhvwtvzaujxmerqkhdlv.supabase.co';
+const SUPABASE_ANON_KEY   = process.env.SUPABASE_ANON_KEY   || '';
+const SUPABASE_SERVICE_KEY= process.env.SUPABASE_SERVICE_KEY || process.env.SUPABASE_SERVICE || '';
+const RAZORPAY_KEY_ID     = process.env.RAZORPAY_KEY_ID     || '';
+const RAZORPAY_KEY_SECRET = process.env.RAZORPAY_KEY_SECRET || '';
+const RAZORPAY_WEBHOOK_SECRET = process.env.RAZORPAY_WEBHOOK_SECRET || '';
+const APP_URL             = process.env.APP_URL             || 'https://vela.grassion.com';
+const NODE_ENV            = process.env.NODE_ENV            || 'development';
+
+const supabaseAnon  = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+const supabaseAdmin = SUPABASE_SERVICE_KEY
+  ? createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY, { auth: { autoRefreshToken: false, persistSession: false } })
+  : null;
 
 // ============================================================
-// DATABASE CONNECTION
+// MIDDLEWARE
 // ============================================================
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ extended: true }));
+app.use(express.static(path.join(__dirname, 'public')));
+
+app.use((req, res, next) => {
+  const allowed = [APP_URL, 'http://localhost:3000', 'https://vela.grassion.com'];
+  const origin = req.headers.origin;
+  if (allowed.includes(origin)) res.setHeader('Access-Control-Allow-Origin', origin);
+  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,PATCH,DELETE,OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, apikey');
+  res.setHeader('Access-Control-Allow-Credentials', 'true');
+  if (req.method === 'OPTIONS') return res.sendStatus(200);
+  next();
 });
 
-// ============================================================
-// DATABASE SCHEMA — Paste this in Supabase SQL Editor once
-// ============================================================
-const SCHEMA = `
-CREATE TABLE IF NOT EXISTS users (
-  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  name VARCHAR(255) NOT NULL,
-  email VARCHAR(255) UNIQUE NOT NULL,
-  password_hash VARCHAR(255) NOT NULL,
-  plan VARCHAR(20) DEFAULT 'trial',
-  trial_start BIGINT,
-  fcm_token TEXT,
-  settings JSONB DEFAULT '{}',
-  created_at TIMESTAMP DEFAULT NOW(),
-  last_active TIMESTAMP DEFAULT NOW()
-);
+app.use((req, res, next) => {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-Frame-Options', 'SAMEORIGIN');
+  next();
+});
 
-CREATE TABLE IF NOT EXISTS units (
-  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  user_id UUID REFERENCES users(id) ON DELETE CASCADE,
-  type VARCHAR(50) NOT NULL,
-  title VARCHAR(500) NOT NULL,
-  description TEXT,
-  start_time TIMESTAMP,
-  end_time TIMESTAMP,
-  deadline TIMESTAMP,
-  duration_minutes INTEGER,
-  recurrence_rule JSONB,
-  priority INTEGER DEFAULT 3,
-  status VARCHAR(30) DEFAULT 'active',
-  is_important BOOLEAN DEFAULT false,
-  bubble_alert BOOLEAN DEFAULT false,
-  metadata JSONB DEFAULT '{}',
-  created_at TIMESTAMP DEFAULT NOW(),
-  updated_at TIMESTAMP DEFAULT NOW()
-);
+app.use((req, res, next) => {
+  const start = Date.now();
+  res.on('finish', () => console.log(`[${new Date().toISOString()}] ${req.method} ${req.path} → ${res.statusCode} (${Date.now()-start}ms)`));
+  next();
+});
 
-CREATE TABLE IF NOT EXISTS notifications_queue (
-  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  user_id UUID REFERENCES users(id) ON DELETE CASCADE,
-  unit_id UUID REFERENCES units(id) ON DELETE CASCADE,
-  trigger_time TIMESTAMP NOT NULL,
-  type VARCHAR(30) NOT NULL,
-  title VARCHAR(500),
-  body TEXT,
-  status VARCHAR(20) DEFAULT 'pending',
-  sent_at TIMESTAMP,
-  created_at TIMESTAMP DEFAULT NOW()
-);
-
-CREATE TABLE IF NOT EXISTS budget_items (
-  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  user_id UUID REFERENCES users(id) ON DELETE CASCADE,
-  name VARCHAR(255) NOT NULL,
-  category VARCHAR(100),
-  amount DECIMAL(12,2) NOT NULL,
-  type VARCHAR(20) DEFAULT 'expense',
-  bill_due_date INTEGER,
-  is_recurring BOOLEAN DEFAULT false,
-  paid BOOLEAN DEFAULT false,
-  month INTEGER,
-  year INTEGER,
-  created_at TIMESTAMP DEFAULT NOW()
-);
-
-CREATE TABLE IF NOT EXISTS health_logs (
-  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  user_id UUID REFERENCES users(id) ON DELETE CASCADE,
-  type VARCHAR(20) NOT NULL,
-  amount INTEGER,
-  calories INTEGER,
-  food_name VARCHAR(255),
-  meal_type VARCHAR(20),
-  logged_at TIMESTAMP DEFAULT NOW()
-);
-
-CREATE TABLE IF NOT EXISTS password_vault (
-  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  user_id UUID REFERENCES users(id) ON DELETE CASCADE,
-  site_name VARCHAR(255) NOT NULL,
-  username VARCHAR(255),
-  encrypted_password TEXT NOT NULL,
-  icon VARCHAR(10),
-  notes TEXT,
-  created_at TIMESTAMP DEFAULT NOW()
-);
-
-CREATE TABLE IF NOT EXISTS analytics_events (
-  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  user_id UUID REFERENCES users(id) ON DELETE CASCADE,
-  action VARCHAR(50) NOT NULL,
-  unit_type VARCHAR(50),
-  metadata JSONB DEFAULT '{}',
-  timestamp TIMESTAMP DEFAULT NOW()
-);
-
-CREATE TABLE IF NOT EXISTS subscriptions (
-  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  user_id UUID REFERENCES users(id) ON DELETE CASCADE,
-  plan VARCHAR(20) NOT NULL,
-  razorpay_payment_id VARCHAR(255),
-  status VARCHAR(20) DEFAULT 'active',
-  amount_paid DECIMAL(10,2),
-  started_at TIMESTAMP DEFAULT NOW(),
-  expires_at TIMESTAMP
-);
-
-CREATE INDEX IF NOT EXISTS idx_units_user ON units(user_id);
-CREATE INDEX IF NOT EXISTS idx_units_type ON units(type);
-CREATE INDEX IF NOT EXISTS idx_units_status ON units(status);
-CREATE INDEX IF NOT EXISTS idx_notif_trigger ON notifications_queue(trigger_time, status);
-CREATE INDEX IF NOT EXISTS idx_analytics_user ON analytics_events(user_id, timestamp);
-`;
-
-async function initDB() {
-  try {
-    await pool.query(SCHEMA);
-    console.log('✅ VELA Database ready');
-  } catch (err) {
-    console.error('DB init error:', err.message);
-  }
+async function requireAuth(req, res, next) {
+  const token = req.headers.authorization?.replace('Bearer ', '');
+  if (!token) return res.status(401).json({ error: 'No token provided' });
+  const { data: { user }, error } = await supabaseAnon.auth.getUser(token);
+  if (error || !user) return res.status(401).json({ error: 'Invalid token' });
+  req.user = user;
+  next();
 }
 
-// ============================================================
-// AUTH MIDDLEWARE
-// ============================================================
-const JWT_SECRET = process.env.JWT_SECRET || 'VelaGrassion2026SecretKey_ChangeThis';
-
-function auth(req, res, next) {
-  const token = req.headers.authorization?.split(' ')[1];
+async function requireAdmin(req, res, next) {
+  const token = req.headers.authorization?.replace('Bearer ', '');
   if (!token) return res.status(401).json({ error: 'No token' });
-  try {
-    req.user = jwt.verify(token, JWT_SECRET);
-    next();
-  } catch {
-    res.status(401).json({ error: 'Invalid token' });
-  }
-}
-
-function adminOnly(req, res, next) {
-  if (req.user.plan !== 'admin' && req.user.email !== process.env.ADMIN_EMAIL) {
-    return res.status(403).json({ error: 'Admin only' });
-  }
+  const { data: { user }, error } = await supabaseAnon.auth.getUser(token);
+  if (error || !user) return res.status(401).json({ error: 'Invalid token' });
+  if (!supabaseAdmin) return res.status(503).json({ error: 'Admin not configured' });
+  const { data: profile } = await supabaseAdmin.from('profiles').select('role').eq('id', user.id).single();
+  if (!profile || !['admin','super_admin'].includes(profile.role)) return res.status(403).json({ error: 'Admin access required' });
+  req.user = user;
   next();
 }
 
 // ============================================================
-// AUTH ROUTES
+// HEALTH
+// ============================================================
+app.get('/health', (req, res) => {
+  res.json({ status: 'ok', app: 'VELA', version: '2.0.0', env: NODE_ENV, timestamp: new Date().toISOString(), supabase: !!SUPABASE_SERVICE_KEY, razorpay: !!RAZORPAY_KEY_ID });
+});
+
+// ============================================================
+// AUTH
 // ============================================================
 app.post('/api/auth/signup', async (req, res) => {
-  const { name, email, password } = req.body;
-  if (!name || !email || !password) return res.status(400).json({ error: 'All fields required' });
   try {
-    const exists = await pool.query('SELECT id FROM users WHERE email=$1', [email]);
-    if (exists.rows.length) return res.status(409).json({ error: 'Email already registered' });
+    const { email, password, full_name } = req.body;
+    if (!email || !password || !full_name) return res.status(400).json({ error: 'All fields required' });
+    if (password.length < 8) return res.status(400).json({ error: 'Password must be at least 8 characters' });
 
-    const hash = await bcrypt.hash(password, 12);
-    const trialStart = Date.now();
-    
-    // Check if this is the admin email — give admin plan
-    const plan = email === process.env.ADMIN_EMAIL ? 'admin' : 'trial';
-    
-    const result = await pool.query(
-      'INSERT INTO users (name, email, password_hash, plan, trial_start) VALUES ($1,$2,$3,$4,$5) RETURNING id, name, email, plan',
-      [name, email, hash, plan, trialStart]
-    );
-    const user = result.rows[0];
-    const token = jwt.sign({ id: user.id, email: user.email, plan: user.plan }, JWT_SECRET, { expiresIn: '30d' });
-    
-    await pool.query('INSERT INTO analytics_events (user_id, action) VALUES ($1,$2)', [user.id, 'signup']);
-    res.json({ token, user });
+    const { data, error } = await supabaseAnon.auth.signUp({
+      email: email.trim().toLowerCase(),
+      password,
+      options: {
+        data: { full_name: full_name.trim() },
+        emailRedirectTo: `${APP_URL}/`
+      }
+    });
+
+    if (error) return res.status(400).json({ error: error.message });
+    if (data.user && data.user.identities?.length === 0) return res.status(400).json({ error: 'Email already registered. Please sign in.' });
+
+    if (data.user && supabaseAdmin) {
+      await supabaseAdmin.from('profiles').upsert({
+        id: data.user.id, full_name: full_name.trim(), email: email.trim().toLowerCase(), plan: 'free', role: 'user', created_at: new Date().toISOString()
+      }, { onConflict: 'id' });
+    }
+
+    res.json({ success: true, message: 'Account created! Check your email to verify your account before signing in.', needs_verification: true });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    console.error('[Signup]', err);
+    res.status(500).json({ error: 'Server error during signup' });
   }
 });
 
-app.post('/api/auth/login', async (req, res) => {
-  const { email, password } = req.body;
+app.post('/api/auth/signin', async (req, res) => {
   try {
-    const result = await pool.query('SELECT * FROM users WHERE email=$1', [email]);
-    if (!result.rows.length) return res.status(401).json({ error: 'Invalid credentials' });
-    
-    const user = result.rows[0];
-    const valid = await bcrypt.compare(password, user.password_hash);
-    if (!valid) return res.status(401).json({ error: 'Invalid credentials' });
-    
-    await pool.query('UPDATE users SET last_active=NOW() WHERE id=$1', [user.id]);
-    const token = jwt.sign({ id: user.id, email: user.email, plan: user.plan }, JWT_SECRET, { expiresIn: '30d' });
-    res.json({ token, user: { id: user.id, name: user.name, email: user.email, plan: user.plan, trial_start: user.trial_start } });
+    const { email, password } = req.body;
+    if (!email || !password) return res.status(400).json({ error: 'Email and password required' });
+
+    const { data, error } = await supabaseAnon.auth.signInWithPassword({ email: email.trim().toLowerCase(), password });
+
+    if (error) {
+      if (error.message.includes('Email not confirmed')) {
+        return res.status(401).json({ error: 'Please verify your email first. Check your inbox.', code: 'EMAIL_NOT_CONFIRMED' });
+      }
+      return res.status(401).json({ error: error.message });
+    }
+
+    let profile = null;
+    if (supabaseAdmin) {
+      const { data: p } = await supabaseAdmin.from('profiles').select('*').eq('id', data.user.id).single();
+      if (!p) {
+        const { data: newP } = await supabaseAdmin.from('profiles').insert({ id: data.user.id, full_name: data.user.user_metadata?.full_name || 'User', email: data.user.email, plan: 'free', role: 'user' }).select().single();
+        profile = newP;
+      } else {
+        profile = p;
+      }
+    }
+
+    res.json({ success: true, session: data.session, user: data.user, profile });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    console.error('[Signin]', err);
+    res.status(500).json({ error: 'Server error during signin' });
   }
 });
 
-app.get('/api/auth/me', auth, async (req, res) => {
-  const result = await pool.query('SELECT id, name, email, plan, trial_start, settings, created_at FROM users WHERE id=$1', [req.user.id]);
-  res.json(result.rows[0]);
-});
-
-// ============================================================
-// MAKE YOURSELF ADMIN — call once with your email
-// ============================================================
-app.post('/api/auth/make-admin', auth, adminOnly, async (req, res) => {
-  const { target_email } = req.body;
-  await pool.query("UPDATE users SET plan='admin' WHERE email=$1", [target_email]);
-  res.json({ success: true, message: target_email + ' is now admin forever' });
-});
-
-// ============================================================
-// UNITS — The core of everything
-// ============================================================
-app.get('/api/units', auth, async (req, res) => {
-  const { type, status } = req.query;
-  let q = 'SELECT * FROM units WHERE user_id=$1';
-  const params = [req.user.id];
-  let i = 2;
-  if (type) { q += ` AND type=$${i++}`; params.push(type); }
-  if (status) { q += ` AND status=$${i++}`; params.push(status); }
-  q += ' ORDER BY start_time ASC NULLS LAST, created_at DESC';
-  const result = await pool.query(q, params);
-  res.json(result.rows);
-});
-
-app.get('/api/units/today', auth, async (req, res) => {
-  const result = await pool.query(
-    `SELECT * FROM units WHERE user_id=$1 AND (DATE(start_time)=CURRENT_DATE OR (deadline>=NOW() AND status='active')) AND status!='archived' ORDER BY start_time ASC NULLS LAST`,
-    [req.user.id]
-  );
-  res.json(result.rows);
-});
-
-app.post('/api/units', auth, async (req, res) => {
-  const { type, title, description, start_time, end_time, deadline, duration_minutes, recurrence_rule, priority, is_important, bubble_alert, metadata } = req.body;
-  const result = await pool.query(
-    `INSERT INTO units (user_id,type,title,description,start_time,end_time,deadline,duration_minutes,recurrence_rule,priority,is_important,bubble_alert,metadata) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING *`,
-    [req.user.id, type, title, description, start_time, end_time, deadline, duration_minutes, recurrence_rule, priority||3, is_important||false, bubble_alert||false, metadata||{}]
-  );
-  const unit = result.rows[0];
-  await scheduleNotifs(unit, req.user.id);
-  await pool.query('INSERT INTO analytics_events (user_id,action,unit_type,unit_id) VALUES ($1,$2,$3,$4)', [req.user.id, 'created', type, unit.id]);
-  res.json(unit);
-});
-
-app.put('/api/units/:id', auth, async (req, res) => {
-  const updates = req.body;
-  const fields = Object.keys(updates).filter(k => !['id','user_id','created_at'].includes(k));
-  if (!fields.length) return res.status(400).json({ error: 'Nothing to update' });
-  const setClause = fields.map((f,i) => `${f}=$${i+2}`).join(', ');
-  const result = await pool.query(
-    `UPDATE units SET ${setClause}, updated_at=NOW() WHERE id=$1 AND user_id='${req.user.id}' RETURNING *`,
-    [req.params.id, ...fields.map(f => updates[f])]
-  );
-  res.json(result.rows[0]);
-});
-
-app.patch('/api/units/:id/complete', auth, async (req, res) => {
-  const result = await pool.query("UPDATE units SET status='completed',updated_at=NOW() WHERE id=$1 AND user_id=$2 RETURNING *", [req.params.id, req.user.id]);
-  await pool.query('INSERT INTO analytics_events (user_id,action,unit_type,unit_id) VALUES ($1,$2,$3,$4)', [req.user.id, 'completed', result.rows[0]?.type, req.params.id]);
-  res.json(result.rows[0]);
-});
-
-app.delete('/api/units/:id', auth, async (req, res) => {
-  await pool.query('DELETE FROM units WHERE id=$1 AND user_id=$2', [req.params.id, req.user.id]);
-  res.json({ success: true });
-});
-
-// ============================================================
-// NOTIFICATION ENGINE
-// ============================================================
-async function scheduleNotifs(unit, userId) {
-  const notifs = [];
-  const now = new Date();
-
-  // Competitions — 4 alerts, 2 days before deadline
-  if (unit.type === 'competition' && unit.deadline) {
-    const dl = new Date(unit.deadline);
-    const twoDays = new Date(dl.getTime() - 2*24*60*60*1000);
-    for (let i = 0; i < 4; i++) {
-      notifs.push({ time: new Date(twoDays.getTime() + i*3*60*60*1000), type: 'urgent', title: `⚡ Competition deadline in 2 days!`, body: unit.title });
-    }
-    notifs.push({ time: new Date(dl.getTime() - 24*60*60*1000), type: 'push', title: `🔴 Last day: ${unit.title}`, body: 'Deadline is tomorrow!' });
-    notifs.push({ time: new Date(dl.getTime() - 2*60*60*1000), type: 'urgent', title: `🚨 FINAL HOURS: ${unit.title}`, body: 'Deadline in 2 hours!' });
-  }
-
-  // Meetings — 1hr + 10min before
-  if ((unit.type === 'meeting' || unit.type === 'events') && unit.start_time) {
-    const start = new Date(unit.start_time);
-    notifs.push({ time: new Date(start.getTime() - 60*60*1000), type: 'push', title: `💼 Meeting in 1 hour`, body: unit.title });
-    notifs.push({ time: new Date(start.getTime() - 10*60*1000), type: 'push', title: `⚡ Meeting in 10 minutes`, body: unit.title });
-  }
-
-  // Floating bubble — 15min before any important event
-  if (unit.bubble_alert && unit.start_time) {
-    const start = new Date(unit.start_time);
-    notifs.push({ time: new Date(start.getTime() - 15*60*1000), type: 'bubble', title: unit.title, body: 'Starting in 15 minutes' });
-  }
-
-  // Food expiry — daily reminder
-  if (unit.type === 'food' && unit.metadata?.expiry_date) {
-    const expiry = new Date(unit.metadata.expiry_date);
-    for (let d = 3; d >= 0; d--) {
-      const t = new Date(expiry.getTime() - d*24*60*60*1000);
-      t.setHours(9,0,0,0);
-      if (t > now) notifs.push({ time: t, type: 'soft', title: `🥘 Use ${unit.title} today`, body: unit.metadata.meal_idea || 'Before it expires!' });
-    }
-  }
-
-  // Birthdays
-  if (unit.type === 'birthday' && unit.start_time) {
-    const bday = new Date(unit.start_time);
-    bday.setHours(8,0,0,0);
-    if (bday > now) notifs.push({ time: bday, type: 'push', title: `🎂 ${unit.title}'s birthday today!`, body: "Don't forget to wish them!" });
-  }
-
-  // Bills due
-  if (unit.type === 'bill' && unit.metadata?.due_date) {
-    const due = new Date(unit.metadata.due_date);
-    const reminder = new Date(due.getTime() - 3*24*60*60*1000);
-    reminder.setHours(9,0,0,0);
-    if (reminder > now) notifs.push({ time: reminder, type: 'push', title: `💳 Bill due in 3 days`, body: `${unit.title} — ₹${unit.metadata.amount}` });
-  }
-
-  for (const n of notifs) {
-    if (n.time > now) {
-      await pool.query(
-        'INSERT INTO notifications_queue (user_id,unit_id,trigger_time,type,title,body) VALUES ($1,$2,$3,$4,$5,$6)',
-        [userId, unit.id, n.time, n.type, n.title, n.body]
-      );
-    }
-  }
-}
-
-// ============================================================
-// CRON — Send pending notifications every minute
-// ============================================================
-cron.schedule('* * * * *', async () => {
+app.post('/api/auth/resend-verification', async (req, res) => {
   try {
-    const due = await pool.query(`SELECT n.*, u.fcm_token FROM notifications_queue n JOIN users u ON n.user_id=u.id WHERE n.trigger_time<=NOW() AND n.status='pending' LIMIT 100`);
-    for (const n of due.rows) {
-      if (n.fcm_token) await sendFCM(n.fcm_token, n.title, n.body, n.type);
-      await pool.query("UPDATE notifications_queue SET status='sent',sent_at=NOW() WHERE id=$1", [n.id]);
-    }
+    const { email } = req.body;
+    if (!email) return res.status(400).json({ error: 'Email required' });
+    const { error } = await supabaseAnon.auth.resend({ type: 'signup', email: email.trim().toLowerCase(), options: { emailRedirectTo: `${APP_URL}/` } });
+    if (error) return res.status(400).json({ error: error.message });
+    res.json({ success: true, message: 'Verification email sent!' });
   } catch (err) {
-    console.error('Notification cron error:', err.message);
+    res.status(500).json({ error: 'Failed to resend email' });
   }
 });
 
-async function sendFCM(token, title, body, type) {
-  // Plug in Firebase Admin SDK when ready:
-  // const admin = require('firebase-admin');
-  // await admin.messaging().send({ token, notification: { title, body }, data: { type } });
-  console.log(`📲 FCM → ${title}: ${body}`);
-}
-
-// ============================================================
-// BUDGET ROUTES
-// ============================================================
-app.get('/api/budget', auth, async (req, res) => {
-  const now = new Date();
-  const result = await pool.query('SELECT * FROM budget_items WHERE user_id=$1 AND (month=$2 OR month IS NULL) ORDER BY created_at DESC', [req.user.id, now.getMonth()+1]);
-  res.json(result.rows);
-});
-
-app.post('/api/budget', auth, async (req, res) => {
-  const { name, category, amount, type, bill_due_date, is_recurring } = req.body;
-  const now = new Date();
-  const result = await pool.query(
-    'INSERT INTO budget_items (user_id,name,category,amount,type,bill_due_date,is_recurring,month,year) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *',
-    [req.user.id, name, category, amount, type||'expense', bill_due_date, is_recurring||false, now.getMonth()+1, now.getFullYear()]
-  );
-  res.json(result.rows[0]);
-});
-
-app.patch('/api/budget/:id/paid', auth, async (req, res) => {
-  const result = await pool.query('UPDATE budget_items SET paid=true WHERE id=$1 AND user_id=$2 RETURNING *', [req.params.id, req.user.id]);
-  res.json(result.rows[0]);
-});
-
-// ============================================================
-// HEALTH ROUTES
-// ============================================================
-app.get('/api/health/logs', auth, async (req, res) => {
-  const result = await pool.query('SELECT * FROM health_logs WHERE user_id=$1 AND DATE(logged_at)=CURRENT_DATE ORDER BY logged_at DESC', [req.user.id]);
-  res.json(result.rows);
-});
-
-app.post('/api/health/log', auth, async (req, res) => {
-  const { type, amount, calories, food_name, meal_type } = req.body;
-  const result = await pool.query(
-    'INSERT INTO health_logs (user_id,type,amount,calories,food_name,meal_type) VALUES ($1,$2,$3,$4,$5,$6) RETURNING *',
-    [req.user.id, type, amount, calories, food_name, meal_type]
-  );
-  res.json(result.rows[0]);
-});
-
-// ============================================================
-// PASSWORD VAULT
-// ============================================================
-app.get('/api/vault', auth, async (req, res) => {
-  const result = await pool.query('SELECT * FROM password_vault WHERE user_id=$1 ORDER BY site_name', [req.user.id]);
-  res.json(result.rows);
-});
-
-app.post('/api/vault', auth, async (req, res) => {
-  const { site_name, username, encrypted_password, icon, notes } = req.body;
-  const result = await pool.query(
-    'INSERT INTO password_vault (user_id,site_name,username,encrypted_password,icon,notes) VALUES ($1,$2,$3,$4,$5,$6) RETURNING *',
-    [req.user.id, site_name, username, encrypted_password, icon, notes]
-  );
-  res.json(result.rows[0]);
-});
-
-app.delete('/api/vault/:id', auth, async (req, res) => {
-  await pool.query('DELETE FROM password_vault WHERE id=$1 AND user_id=$2', [req.params.id, req.user.id]);
-  res.json({ success: true });
-});
-
-// ============================================================
-// PAYMENTS — RAZORPAY
-// ============================================================
-app.post('/api/payments/create-order', auth, async (req, res) => {
-  const { plan } = req.body;
-  const prices = { monthly: 29900, annual: 199900 };
-
-  // When Razorpay keys are added, uncomment:
-  // const Razorpay = require('razorpay');
-  // const rz = new Razorpay({ key_id: process.env.RAZORPAY_KEY_ID, key_secret: process.env.RAZORPAY_KEY_SECRET });
-  // const order = await rz.orders.create({ amount: prices[plan], currency: 'INR', receipt: uuidv4() });
-
-  const order = { id: 'order_test_' + Date.now(), amount: prices[plan] || 29900, currency: 'INR' };
-  res.json({ order, key_id: process.env.RAZORPAY_KEY_ID || 'rzp_test_placeholder' });
-});
-
-app.post('/api/payments/verify', auth, async (req, res) => {
-  const { razorpay_payment_id, plan } = req.body;
-  const expires = plan === 'annual'
-    ? new Date(Date.now() + 365*24*60*60*1000)
-    : new Date(Date.now() + 30*24*60*60*1000);
-  await pool.query("UPDATE users SET plan='premium' WHERE id=$1", [req.user.id]);
-  await pool.query('INSERT INTO subscriptions (user_id,plan,razorpay_payment_id,expires_at) VALUES ($1,$2,$3,$4)', [req.user.id, plan, razorpay_payment_id, expires]);
-  res.json({ success: true });
-});
-
-// ============================================================
-// FCM TOKEN
-// ============================================================
-app.post('/api/user/fcm-token', auth, async (req, res) => {
-  await pool.query('UPDATE users SET fcm_token=$1 WHERE id=$2', [req.body.token, req.user.id]);
-  res.json({ success: true });
-});
-
-// ============================================================
-// SETTINGS
-// ============================================================
-app.put('/api/user/settings', auth, async (req, res) => {
-  await pool.query('UPDATE users SET settings=$1 WHERE id=$2', [req.body, req.user.id]);
-  res.json({ success: true });
-});
-
-// ============================================================
-// ANALYTICS
-// ============================================================
-app.get('/api/analytics/summary', auth, async (req, res) => {
-  const [stats, byType] = await Promise.all([
-    pool.query(`SELECT COUNT(*) FILTER(WHERE status='completed') as completed, COUNT(*) FILTER(WHERE status='missed') as missed, COUNT(*) as total FROM units WHERE user_id=$1 AND created_at>=NOW()-INTERVAL '30 days'`, [req.user.id]),
-    pool.query('SELECT type, COUNT(*) as count FROM units WHERE user_id=$1 GROUP BY type', [req.user.id])
-  ]);
-  const s = stats.rows[0];
-  res.json({
-    completion_rate: s.total > 0 ? Math.round((s.completed/s.total)*100) : 0,
-    completed: parseInt(s.completed),
-    missed: parseInt(s.missed),
-    total: parseInt(s.total),
-    by_type: byType.rows
-  });
-});
-
-// ============================================================
-// ADMIN PANEL
-// ============================================================
-app.get('/api/admin/stats', auth, adminOnly, async (req, res) => {
-  const [users, active, revenue, features, recent] = await Promise.all([
-    pool.query('SELECT COUNT(*) FROM users'),
-    pool.query("SELECT COUNT(*) FROM users WHERE last_active>=NOW()-INTERVAL '24 hours'"),
-    pool.query("SELECT COALESCE(SUM(amount_paid),0) as mrr FROM subscriptions WHERE started_at>=DATE_TRUNC('month',NOW())"),
-    pool.query('SELECT type, COUNT(*) as count FROM units GROUP BY type ORDER BY count DESC'),
-    pool.query('SELECT id,name,email,plan,created_at,last_active FROM users ORDER BY created_at DESC LIMIT 20'),
-  ]);
-  res.json({
-    total_users: parseInt(users.rows[0].count),
-    active_today: parseInt(active.rows[0].count),
-    mrr: parseFloat(revenue.rows[0].mrr),
-    feature_usage: features.rows,
-    recent_signups: recent.rows
-  });
-});
-
-app.get('/api/admin/users', auth, adminOnly, async (req, res) => {
-  const { search, limit=50 } = req.query;
-  let q = 'SELECT id,name,email,plan,created_at,last_active FROM users';
-  const params = [];
-  if (search) { q += ' WHERE name ILIKE $1 OR email ILIKE $1'; params.push(`%${search}%`); }
-  q += ` ORDER BY created_at DESC LIMIT ${limit}`;
-  const result = await pool.query(q, params);
-  res.json(result.rows);
-});
-
-app.patch('/api/admin/users/:id/plan', auth, adminOnly, async (req, res) => {
-  await pool.query('UPDATE users SET plan=$1 WHERE id=$2', [req.body.plan, req.params.id]);
-  res.json({ success: true });
-});
-
-// ============================================================
-// HEALTH CHECK
-// ============================================================
-app.get('/health', (req, res) => res.json({ status: 'ok', app: 'VELA', version: '1.0.0', powered_by: 'Grassion' }));
-
-// Serve the VELA web app HTML if it exists in the same directory
-app.get('/', (req, res) => {
-  const htmlPath = path.join(__dirname, 'vela-app-final.html');
-  if (fs.existsSync(htmlPath)) {
-    res.sendFile(htmlPath);
-  } else {
-    res.json({ app: 'VELA Backend', tagline: 'Run Your Life.', status: 'running',
-      note: 'Upload vela-app-final.html to this directory to serve the app here' });
+app.post('/api/auth/reset-password', async (req, res) => {
+  try {
+    const { email } = req.body;
+    if (!email) return res.status(400).json({ error: 'Email required' });
+    const { error } = await supabaseAnon.auth.resetPasswordForEmail(email.trim().toLowerCase(), { redirectTo: `${APP_URL}/` });
+    if (error) return res.status(400).json({ error: error.message });
+    res.json({ success: true, message: 'Password reset email sent!' });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to send reset email' });
   }
 });
 
-// Serve any other static files
-app.use(express.static(__dirname));
+// ============================================================
+// PROFILE
+// ============================================================
+app.get('/api/user/profile', requireAuth, async (req, res) => {
+  try {
+    if (!supabaseAdmin) return res.status(503).json({ error: 'Admin not configured' });
+    const { data, error } = await supabaseAdmin.from('profiles').select('*').eq('id', req.user.id).single();
+    if (error) return res.status(404).json({ error: 'Profile not found' });
+    res.json({ profile: data });
+  } catch (err) { res.status(500).json({ error: 'Failed to fetch profile' }); }
+});
+
+app.patch('/api/user/profile', requireAuth, async (req, res) => {
+  try {
+    if (!supabaseAdmin) return res.status(503).json({ error: 'Admin not configured' });
+    const updates = {};
+    if (req.body.full_name) updates.full_name = req.body.full_name.trim();
+    updates.updated_at = new Date().toISOString();
+    const { data, error } = await supabaseAdmin.from('profiles').update(updates).eq('id', req.user.id).select().single();
+    if (error) return res.status(400).json({ error: error.message });
+    res.json({ success: true, profile: data });
+  } catch (err) { res.status(500).json({ error: 'Failed to update profile' }); }
+});
 
 // ============================================================
-// START SERVER
+// TASKS
 // ============================================================
-const PORT = process.env.PORT || 4000;
-app.listen(PORT, async () => {
-  await initDB();
-  console.log(`🚀 VELA Backend running on port ${PORT}`);
-  console.log(`💜 Run your whole life. | Powered by Grassion`);
+app.get('/api/tasks', requireAuth, async (req, res) => {
+  try {
+    if (!supabaseAdmin) return res.status(503).json({ error: 'Admin not configured' });
+    const { data, error } = await supabaseAdmin.from('tasks').select('*').eq('user_id', req.user.id).order('created_at', { ascending: false });
+    if (error) return res.status(400).json({ error: error.message });
+    res.json({ tasks: data });
+  } catch (err) { res.status(500).json({ error: 'Failed to fetch tasks' }); }
+});
+
+app.post('/api/tasks', requireAuth, async (req, res) => {
+  try {
+    if (!supabaseAdmin) return res.status(503).json({ error: 'Admin not configured' });
+    const { title, description, priority, due_date, category } = req.body;
+    if (!title) return res.status(400).json({ error: 'Title required' });
+    const { data, error } = await supabaseAdmin.from('tasks').insert({ user_id: req.user.id, title, description, priority: priority || 'medium', due_date: due_date || null, category: category || 'personal', completed: false }).select().single();
+    if (error) return res.status(400).json({ error: error.message });
+    res.json({ success: true, task: data });
+  } catch (err) { res.status(500).json({ error: 'Failed to create task' }); }
+});
+
+app.patch('/api/tasks/:id', requireAuth, async (req, res) => {
+  try {
+    if (!supabaseAdmin) return res.status(503).json({ error: 'Admin not configured' });
+    const updates = { ...req.body };
+    delete updates.user_id;
+    const { data, error } = await supabaseAdmin.from('tasks').update(updates).eq('id', req.params.id).eq('user_id', req.user.id).select().single();
+    if (error) return res.status(400).json({ error: error.message });
+    res.json({ success: true, task: data });
+  } catch (err) { res.status(500).json({ error: 'Failed to update task' }); }
+});
+
+app.delete('/api/tasks/:id', requireAuth, async (req, res) => {
+  try {
+    if (!supabaseAdmin) return res.status(503).json({ error: 'Admin not configured' });
+    await supabaseAdmin.from('tasks').delete().eq('id', req.params.id).eq('user_id', req.user.id);
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: 'Failed to delete task' }); }
+});
+
+// ============================================================
+// TRANSACTIONS
+// ============================================================
+app.get('/api/transactions', requireAuth, async (req, res) => {
+  try {
+    if (!supabaseAdmin) return res.status(503).json({ error: 'Admin not configured' });
+    const { data, error } = await supabaseAdmin.from('transactions').select('*').eq('user_id', req.user.id).order('date', { ascending: false });
+    if (error) return res.status(400).json({ error: error.message });
+    res.json({ transactions: data });
+  } catch (err) { res.status(500).json({ error: 'Failed to fetch transactions' }); }
+});
+
+app.post('/api/transactions', requireAuth, async (req, res) => {
+  try {
+    if (!supabaseAdmin) return res.status(503).json({ error: 'Admin not configured' });
+    const { type, description, amount, date, category, status } = req.body;
+    if (!description || !amount) return res.status(400).json({ error: 'Description and amount required' });
+    const { data, error } = await supabaseAdmin.from('transactions').insert({ user_id: req.user.id, type: type || 'expense', description, amount: parseFloat(amount), date: date || new Date().toISOString().split('T')[0], category: category || 'other', status: status || 'paid' }).select().single();
+    if (error) return res.status(400).json({ error: error.message });
+    res.json({ success: true, transaction: data });
+  } catch (err) { res.status(500).json({ error: 'Failed to create transaction' }); }
+});
+
+app.delete('/api/transactions/:id', requireAuth, async (req, res) => {
+  try {
+    if (!supabaseAdmin) return res.status(503).json({ error: 'Admin not configured' });
+    await supabaseAdmin.from('transactions').delete().eq('id', req.params.id).eq('user_id', req.user.id);
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: 'Failed to delete transaction' }); }
+});
+
+// ============================================================
+// FOODS
+// ============================================================
+app.get('/api/foods', requireAuth, async (req, res) => {
+  try {
+    if (!supabaseAdmin) return res.status(503).json({ error: 'Admin not configured' });
+    const date = req.query.date || new Date().toISOString().split('T')[0];
+    const { data, error } = await supabaseAdmin.from('foods').select('*').eq('user_id', req.user.id).eq('date', date);
+    if (error) return res.status(400).json({ error: error.message });
+    res.json({ foods: data });
+  } catch (err) { res.status(500).json({ error: 'Failed to fetch foods' }); }
+});
+
+app.post('/api/foods', requireAuth, async (req, res) => {
+  try {
+    if (!supabaseAdmin) return res.status(503).json({ error: 'Admin not configured' });
+    const { name, meal, calories, protein, carbs, fat } = req.body;
+    if (!name) return res.status(400).json({ error: 'Food name required' });
+    const { data, error } = await supabaseAdmin.from('foods').insert({ user_id: req.user.id, name, meal: meal || 'breakfast', calories: parseInt(calories)||0, protein: parseInt(protein)||0, carbs: parseInt(carbs)||0, fat: parseInt(fat)||0, date: new Date().toISOString().split('T')[0] }).select().single();
+    if (error) return res.status(400).json({ error: error.message });
+    res.json({ success: true, food: data });
+  } catch (err) { res.status(500).json({ error: 'Failed to add food' }); }
+});
+
+app.delete('/api/foods/:id', requireAuth, async (req, res) => {
+  try {
+    if (!supabaseAdmin) return res.status(503).json({ error: 'Admin not configured' });
+    await supabaseAdmin.from('foods').delete().eq('id', req.params.id).eq('user_id', req.user.id);
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: 'Failed to delete food' }); }
+});
+
+// ============================================================
+// HABITS
+// ============================================================
+app.get('/api/habits', requireAuth, async (req, res) => {
+  try {
+    if (!supabaseAdmin) return res.status(503).json({ error: 'Admin not configured' });
+    const today = new Date().toISOString().split('T')[0];
+    const [habitsRes, checksRes] = await Promise.all([
+      supabaseAdmin.from('habits').select('*').eq('user_id', req.user.id),
+      supabaseAdmin.from('habit_checks').select('habit_id').eq('user_id', req.user.id).eq('check_date', today)
+    ]);
+    res.json({ habits: habitsRes.data || [], checks: checksRes.data || [] });
+  } catch (err) { res.status(500).json({ error: 'Failed to fetch habits' }); }
+});
+
+app.post('/api/habits', requireAuth, async (req, res) => {
+  try {
+    if (!supabaseAdmin) return res.status(503).json({ error: 'Admin not configured' });
+    const { name, icon, frequency } = req.body;
+    if (!name) return res.status(400).json({ error: 'Habit name required' });
+    const { data, error } = await supabaseAdmin.from('habits').insert({ user_id: req.user.id, name, icon: icon || '⭐', frequency: frequency || 'daily', streak: 0 }).select().single();
+    if (error) return res.status(400).json({ error: error.message });
+    res.json({ success: true, habit: data });
+  } catch (err) { res.status(500).json({ error: 'Failed to create habit' }); }
+});
+
+app.post('/api/habits/:id/check', requireAuth, async (req, res) => {
+  try {
+    if (!supabaseAdmin) return res.status(503).json({ error: 'Admin not configured' });
+    const today = new Date().toISOString().split('T')[0];
+    const { done } = req.body;
+    if (done) {
+      await supabaseAdmin.from('habit_checks').upsert({ user_id: req.user.id, habit_id: req.params.id, check_date: today }, { onConflict: 'user_id,habit_id,check_date' });
+      const { data: h } = await supabaseAdmin.from('habits').select('streak').eq('id', req.params.id).single();
+      await supabaseAdmin.from('habits').update({ streak: (h?.streak||0)+1 }).eq('id', req.params.id);
+    } else {
+      await supabaseAdmin.from('habit_checks').delete().eq('habit_id', req.params.id).eq('user_id', req.user.id).eq('check_date', today);
+    }
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: 'Failed to update habit' }); }
+});
+
+app.delete('/api/habits/:id', requireAuth, async (req, res) => {
+  try {
+    if (!supabaseAdmin) return res.status(503).json({ error: 'Admin not configured' });
+    await Promise.all([supabaseAdmin.from('habit_checks').delete().eq('habit_id', req.params.id).eq('user_id', req.user.id), supabaseAdmin.from('habits').delete().eq('id', req.params.id).eq('user_id', req.user.id)]);
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: 'Failed to delete habit' }); }
+});
+
+// ============================================================
+// EVENTS
+// ============================================================
+app.get('/api/events', requireAuth, async (req, res) => {
+  try {
+    if (!supabaseAdmin) return res.status(503).json({ error: 'Admin not configured' });
+    const { data, error } = await supabaseAdmin.from('events').select('*').eq('user_id', req.user.id).order('event_date', { ascending: true });
+    if (error) return res.status(400).json({ error: error.message });
+    res.json({ events: data });
+  } catch (err) { res.status(500).json({ error: 'Failed to fetch events' }); }
+});
+
+app.post('/api/events', requireAuth, async (req, res) => {
+  try {
+    if (!supabaseAdmin) return res.status(503).json({ error: 'Admin not configured' });
+    const { title, event_date, event_time, note } = req.body;
+    if (!title || !event_date) return res.status(400).json({ error: 'Title and date required' });
+    const { data, error } = await supabaseAdmin.from('events').insert({ user_id: req.user.id, title, event_date, event_time: event_time || null, note: note || '' }).select().single();
+    if (error) return res.status(400).json({ error: error.message });
+    res.json({ success: true, event: data });
+  } catch (err) { res.status(500).json({ error: 'Failed to create event' }); }
+});
+
+app.delete('/api/events/:id', requireAuth, async (req, res) => {
+  try {
+    if (!supabaseAdmin) return res.status(503).json({ error: 'Admin not configured' });
+    await supabaseAdmin.from('events').delete().eq('id', req.params.id).eq('user_id', req.user.id);
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: 'Failed to delete event' }); }
+});
+
+// ============================================================
+// TRIPS
+// ============================================================
+app.get('/api/trips', requireAuth, async (req, res) => {
+  try {
+    if (!supabaseAdmin) return res.status(503).json({ error: 'Admin not configured' });
+    const { data, error } = await supabaseAdmin.from('trips').select('*').eq('user_id', req.user.id);
+    if (error) return res.status(400).json({ error: error.message });
+    res.json({ trips: data });
+  } catch (err) { res.status(500).json({ error: 'Failed to fetch trips' }); }
+});
+
+app.post('/api/trips', requireAuth, async (req, res) => {
+  try {
+    if (!supabaseAdmin) return res.status(503).json({ error: 'Admin not configured' });
+    const { destination, from_date, to_date, budget } = req.body;
+    if (!destination) return res.status(400).json({ error: 'Destination required' });
+    const { data, error } = await supabaseAdmin.from('trips').insert({ user_id: req.user.id, destination, from_date: from_date || null, to_date: to_date || null, budget: parseFloat(budget)||null }).select().single();
+    if (error) return res.status(400).json({ error: error.message });
+    res.json({ success: true, trip: data });
+  } catch (err) { res.status(500).json({ error: 'Failed to create trip' }); }
+});
+
+app.delete('/api/trips/:id', requireAuth, async (req, res) => {
+  try {
+    if (!supabaseAdmin) return res.status(503).json({ error: 'Admin not configured' });
+    await supabaseAdmin.from('trips').delete().eq('id', req.params.id).eq('user_id', req.user.id);
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: 'Failed to delete trip' }); }
+});
+
+// ============================================================
+// VAULT
+// ============================================================
+app.get('/api/vault', requireAuth, async (req, res) => {
+  try {
+    if (!supabaseAdmin) return res.status(503).json({ error: 'Admin not configured' });
+    const { data, error } = await supabaseAdmin.from('vault').select('*').eq('user_id', req.user.id);
+    if (error) return res.status(400).json({ error: error.message });
+    res.json({ vault: data });
+  } catch (err) { res.status(500).json({ error: 'Failed to fetch vault' }); }
+});
+
+app.post('/api/vault', requireAuth, async (req, res) => {
+  try {
+    if (!supabaseAdmin) return res.status(503).json({ error: 'Admin not configured' });
+    const { site_name, username, password, url, notes } = req.body;
+    if (!site_name || !password) return res.status(400).json({ error: 'Site name and password required' });
+    const { data, error } = await supabaseAdmin.from('vault').insert({ user_id: req.user.id, site_name, username: username||'', password: Buffer.from(password).toString('base64'), url: url||'', notes: notes||'' }).select().single();
+    if (error) return res.status(400).json({ error: error.message });
+    res.json({ success: true, vault_item: data });
+  } catch (err) { res.status(500).json({ error: 'Failed to save vault item' }); }
+});
+
+app.delete('/api/vault/:id', requireAuth, async (req, res) => {
+  try {
+    if (!supabaseAdmin) return res.status(503).json({ error: 'Admin not configured' });
+    await supabaseAdmin.from('vault').delete().eq('id', req.params.id).eq('user_id', req.user.id);
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: 'Failed to delete vault item' }); }
+});
+
+// ============================================================
+// POSTS
+// ============================================================
+app.get('/api/posts', requireAuth, async (req, res) => {
+  try {
+    if (!supabaseAdmin) return res.status(503).json({ error: 'Admin not configured' });
+    const { data, error } = await supabaseAdmin.from('posts').select('*').eq('user_id', req.user.id).order('created_at', { ascending: false });
+    if (error) return res.status(400).json({ error: error.message });
+    res.json({ posts: data });
+  } catch (err) { res.status(500).json({ error: 'Failed to fetch posts' }); }
+});
+
+app.post('/api/posts', requireAuth, async (req, res) => {
+  try {
+    if (!supabaseAdmin) return res.status(503).json({ error: 'Admin not configured' });
+    const { platform, content, scheduled_at } = req.body;
+    if (!content) return res.status(400).json({ error: 'Content required' });
+    const { data, error } = await supabaseAdmin.from('posts').insert({ user_id: req.user.id, platform: platform||'twitter', content, scheduled_at: scheduled_at||null, status: scheduled_at ? 'scheduled' : 'draft' }).select().single();
+    if (error) return res.status(400).json({ error: error.message });
+    res.json({ success: true, post: data });
+  } catch (err) { res.status(500).json({ error: 'Failed to create post' }); }
+});
+
+app.delete('/api/posts/:id', requireAuth, async (req, res) => {
+  try {
+    if (!supabaseAdmin) return res.status(503).json({ error: 'Admin not configured' });
+    await supabaseAdmin.from('posts').delete().eq('id', req.params.id).eq('user_id', req.user.id);
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: 'Failed to delete post' }); }
+});
+
+// ============================================================
+// EXERCISES
+// ============================================================
+app.get('/api/exercises', requireAuth, async (req, res) => {
+  try {
+    if (!supabaseAdmin) return res.status(503).json({ error: 'Admin not configured' });
+    const { data, error } = await supabaseAdmin.from('exercises').select('*').eq('user_id', req.user.id);
+    if (error) return res.status(400).json({ error: error.message });
+    res.json({ exercises: data });
+  } catch (err) { res.status(500).json({ error: 'Failed to fetch exercises' }); }
+});
+
+app.post('/api/exercises', requireAuth, async (req, res) => {
+  try {
+    if (!supabaseAdmin) return res.status(503).json({ error: 'Admin not configured' });
+    const { name, sets, reps_or_duration, category } = req.body;
+    if (!name) return res.status(400).json({ error: 'Exercise name required' });
+    const { data, error } = await supabaseAdmin.from('exercises').insert({ user_id: req.user.id, name, sets: sets||'3', reps_or_duration: reps_or_duration||'10', category: category||'strength' }).select().single();
+    if (error) return res.status(400).json({ error: error.message });
+    res.json({ success: true, exercise: data });
+  } catch (err) { res.status(500).json({ error: 'Failed to add exercise' }); }
+});
+
+app.delete('/api/exercises/:id', requireAuth, async (req, res) => {
+  try {
+    if (!supabaseAdmin) return res.status(503).json({ error: 'Admin not configured' });
+    await supabaseAdmin.from('exercises').delete().eq('id', req.params.id).eq('user_id', req.user.id);
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: 'Failed to delete exercise' }); }
+});
+
+// ============================================================
+// RAZORPAY
+// ============================================================
+app.post('/api/payment/create-order', requireAuth, async (req, res) => {
+  try {
+    if (!RAZORPAY_KEY_ID || !RAZORPAY_KEY_SECRET) return res.status(503).json({ error: 'Payment not configured' });
+    const { plan } = req.body;
+    const prices = { pro: 19900, premium: 49900 };
+    const amount = prices[plan];
+    if (!amount) return res.status(400).json({ error: 'Invalid plan' });
+
+    const Razorpay = require('razorpay');
+    const rzp = new Razorpay({ key_id: RAZORPAY_KEY_ID, key_secret: RAZORPAY_KEY_SECRET });
+    const order = await rzp.orders.create({ amount, currency: 'INR', receipt: `vela_${plan}_${Date.now()}`, notes: { user_id: req.user.id, plan, user_email: req.user.email } });
+    res.json({ success: true, order, key_id: RAZORPAY_KEY_ID });
+  } catch (err) {
+    console.error('[Payment Order]', err);
+    res.status(500).json({ error: 'Failed to create payment order' });
+  }
+});
+
+app.post('/api/payment/verify', requireAuth, async (req, res) => {
+  try {
+    const { razorpay_order_id, razorpay_payment_id, razorpay_signature, plan } = req.body;
+    if (!RAZORPAY_KEY_SECRET) return res.status(503).json({ error: 'Payment not configured' });
+
+    const expectedSig = crypto.createHmac('sha256', RAZORPAY_KEY_SECRET).update(`${razorpay_order_id}|${razorpay_payment_id}`).digest('hex');
+    if (expectedSig !== razorpay_signature) return res.status(400).json({ error: 'Payment verification failed' });
+
+    if (supabaseAdmin) {
+      await supabaseAdmin.from('profiles').update({ plan, razorpay_payment_id, updated_at: new Date().toISOString() }).eq('id', req.user.id);
+      await supabaseAdmin.from('transactions').insert({ user_id: req.user.id, type: 'expense', description: `VELA ${plan} subscription`, amount: plan === 'pro' ? 199 : 499, date: new Date().toISOString().split('T')[0], category: 'subscription', status: 'paid' });
+    }
+    res.json({ success: true, plan, message: `Upgraded to ${plan}!` });
+  } catch (err) {
+    console.error('[Payment Verify]', err);
+    res.status(500).json({ error: 'Payment verification error' });
+  }
+});
+
+app.post('/webhook/razorpay', express.raw({ type: 'application/json' }), async (req, res) => {
+  try {
+    if (RAZORPAY_WEBHOOK_SECRET) {
+      const sig = req.headers['x-razorpay-signature'];
+      const expected = crypto.createHmac('sha256', RAZORPAY_WEBHOOK_SECRET).update(req.body).digest('hex');
+      if (sig !== expected) return res.status(400).json({ error: 'Invalid signature' });
+    }
+    const event = JSON.parse(req.body);
+    if (event.event === 'payment.captured' && supabaseAdmin) {
+      const p = event.payload.payment.entity;
+      if (p.notes?.user_id && p.notes?.plan) {
+        await supabaseAdmin.from('profiles').update({ plan: p.notes.plan, razorpay_payment_id: p.id }).eq('id', p.notes.user_id);
+      }
+    }
+    res.json({ status: 'ok' });
+  } catch (err) {
+    console.error('[Webhook]', err);
+    res.status(500).json({ error: 'Webhook error' });
+  }
+});
+
+// ============================================================
+// ADMIN
+// ============================================================
+app.get('/api/admin/stats', requireAdmin, async (req, res) => {
+  try {
+    const { data: users } = await supabaseAdmin.from('profiles').select('*').order('created_at', { ascending: false });
+    const all = users || [];
+    const pro = all.filter(u => u.plan === 'pro').length;
+    const premium = all.filter(u => u.plan === 'premium').length;
+    const [tasks, txns, habits] = await Promise.all([
+      supabaseAdmin.from('tasks').select('id', { count: 'exact', head: true }),
+      supabaseAdmin.from('transactions').select('id', { count: 'exact', head: true }),
+      supabaseAdmin.from('habits').select('id', { count: 'exact', head: true }),
+    ]);
+    res.json({ users: all, stats: { total_users: all.length, pro_users: pro, premium_users: premium, free_users: all.length-pro-premium, estimated_revenue: (pro*199)+(premium*499), total_tasks: tasks.count||0, total_transactions: txns.count||0, total_habits: habits.count||0 } });
+  } catch (err) { res.status(500).json({ error: 'Failed to fetch admin stats' }); }
+});
+
+app.post('/api/admin/grant-plan', requireAdmin, async (req, res) => {
+  try {
+    const { email, plan } = req.body;
+    if (!email || !plan) return res.status(400).json({ error: 'Email and plan required' });
+    const { data, error } = await supabaseAdmin.from('profiles').update({ plan, updated_at: new Date().toISOString() }).eq('email', email.toLowerCase()).select();
+    if (error || !data?.length) return res.status(404).json({ error: 'User not found' });
+    res.json({ success: true, message: `Plan ${plan} granted to ${email}` });
+  } catch (err) { res.status(500).json({ error: 'Failed to grant plan' }); }
+});
+
+app.post('/api/admin/notify', requireAdmin, async (req, res) => {
+  try {
+    const { title, body, target_plan } = req.body;
+    if (!title || !body) return res.status(400).json({ error: 'Title and body required' });
+    await supabaseAdmin.from('notifications_queue').insert({ title, body, type: 'broadcast', target_plan: target_plan||'all', status: 'pending' });
+    res.json({ success: true, message: `Notification queued for ${target_plan||'all'} users` });
+  } catch (err) { res.status(500).json({ error: 'Failed to queue notification' }); }
+});
+
+app.delete('/api/admin/users/:id', requireAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    await Promise.all([
+      supabaseAdmin.from('tasks').delete().eq('user_id', id),
+      supabaseAdmin.from('transactions').delete().eq('user_id', id),
+      supabaseAdmin.from('foods').delete().eq('user_id', id),
+      supabaseAdmin.from('habits').delete().eq('user_id', id),
+      supabaseAdmin.from('habit_checks').delete().eq('user_id', id),
+      supabaseAdmin.from('events').delete().eq('user_id', id),
+      supabaseAdmin.from('trips').delete().eq('user_id', id),
+      supabaseAdmin.from('vault').delete().eq('user_id', id),
+      supabaseAdmin.from('posts').delete().eq('user_id', id),
+      supabaseAdmin.from('exercises').delete().eq('user_id', id),
+      supabaseAdmin.from('profiles').delete().eq('id', id),
+    ]);
+    await supabaseAdmin.auth.admin.deleteUser(id);
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: 'Failed to delete user' }); }
+});
+
+// ============================================================
+// CONFIG
+// ============================================================
+app.get('/api/config', (req, res) => {
+  res.json({ razorpay_key_id: RAZORPAY_KEY_ID, app_url: APP_URL });
+});
+
+// ============================================================
+// SERVE FRONTEND
+// ============================================================
+app.get('/', (req, res) => res.sendFile(path.join(__dirname, 'vela-app-final.html')));
+app.get('/admin', (req, res) => res.sendFile(path.join(__dirname, 'vela-app-final.html')));
+app.get('*', (req, res) => {
+  if (req.path.startsWith('/api/') || req.path.startsWith('/webhook/')) return res.status(404).json({ error: 'Not found' });
+  res.sendFile(path.join(__dirname, 'vela-app-final.html'));
+});
+
+// ============================================================
+// ERROR HANDLER
+// ============================================================
+app.use((err, req, res, next) => {
+  console.error('[Error]', err);
+  res.status(500).json({ error: 'Internal server error' });
+});
+
+// ============================================================
+// START
+// ============================================================
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`VELA v2.0 running on port ${PORT} | ${NODE_ENV}`);
+  console.log(`Supabase: ${SUPABASE_URL} | Admin: ${!!SUPABASE_SERVICE_KEY}`);
+  console.log(`Razorpay: ${!!RAZORPAY_KEY_ID} | App: ${APP_URL}`);
 });
 
 module.exports = app;
