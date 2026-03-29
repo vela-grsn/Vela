@@ -1455,8 +1455,8 @@ tr:hover td { background: var(--bg2); }
 
     <!-- TABS -->
     <div style="display:flex;background:#f0f4f8;border-radius:8px;padding:3px;margin-bottom:22px;">
-      <div class="auth-tab active" onclick="switchAuthTab('login')" style="flex:1;padding:9px;text-align:center;border-radius:6px;font-size:14px;font-weight:500;color:#4a5568;cursor:pointer;transition:0.2s;">Sign In</div>
-      <div class="auth-tab" onclick="switchAuthTab('signup')" style="flex:1;padding:9px;text-align:center;border-radius:6px;font-size:14px;font-weight:500;color:#4a5568;cursor:pointer;transition:0.2s;">Sign Up</div>
+      <div class="auth-tab active" onclick="switchAuthTab('login', this)" style="flex:1;padding:9px;text-align:center;border-radius:6px;font-size:14px;font-weight:500;color:#4a5568;cursor:pointer;transition:0.2s;">Sign In</div>
+      <div class="auth-tab" onclick="switchAuthTab('signup', this)" style="flex:1;padding:9px;text-align:center;border-radius:6px;font-size:14px;font-weight:500;color:#4a5568;cursor:pointer;transition:0.2s;">Sign Up</div>
     </div>
 
     <div id="auth-msg" class="auth-msg"></div>
@@ -2750,9 +2750,9 @@ async function loadApp() {
 // ============================================================
 // AUTH
 // ============================================================
-function switchAuthTab(tab) {
+function switchAuthTab(tab, el) {
   document.querySelectorAll('.auth-tab').forEach(t => t.classList.remove('active'));
-  event.target.classList.add('active');
+  if (el) el.classList.add('active');
   document.getElementById('login-form').classList.toggle('hidden', tab !== 'login');
   document.getElementById('signup-form').classList.toggle('hidden', tab !== 'signup');
   clearAuthMsg();
