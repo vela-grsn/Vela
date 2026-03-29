@@ -2637,6 +2637,40 @@ let allUsersCache = [];
 // INIT
 // ============================================================
 async function init() {
+  // HANDLE EMAIL VERIFICATION CALLBACK
+  // When user clicks verify link in email, Supabase redirects here with tokens in URL
+  const hashParams = new URLSearchParams(window.location.hash.slice(1));
+  const accessToken = hashParams.get('access_token');
+  const tokenType = hashParams.get('type');
+  
+  if (accessToken && tokenType === 'signup') {
+    // Email verified! Set the session and load app
+    try {
+      const { data, error } = await sb.auth.setSession({
+        access_token: accessToken,
+        refresh_token: hashParams.get('refresh_token') || ''
+      });
+      if (!error && data.user) {
+        // Clear the hash from URL
+        window.history.replaceState({}, document.title, window.location.pathname);
+        currentUser = data.user;
+        await loadApp();
+        showToast('Email verified! Welcome to VELA 🎉', 'success');
+        return;
+      }
+    } catch(e) { console.error('Verification callback error:', e); }
+  }
+  
+  if (accessToken && tokenType === 'recovery') {
+    // Password reset callback
+    window.history.replaceState({}, document.title, window.location.pathname);
+    // Show password reset UI (for now just go to auth)
+    hideLoading();
+    showScreen('auth-screen');
+    showAuthMsg('Please sign in with your new password.', 'success');
+    return;
+  }
+
   // Guaranteed fallback - ALWAYS show auth after 5 seconds no matter what
   const fallbackTimer = setTimeout(() => {
     hideLoading();
@@ -2679,7 +2713,16 @@ async function init() {
   }
 
   sb.auth.onAuthStateChange(async (event, session) => {
-    if (event === 'SIGNED_OUT') {
+    if (event === 'SIGNED_IN' && session && !currentUser) {
+      // This fires after email verification redirect
+      currentUser = session.user;
+      if (document.getElementById('loading').style.display !== 'none' ||
+          document.getElementById('auth-screen').style.display !== 'none') {
+        await loadApp();
+      }
+    } else if (event === 'USER_UPDATED' && session) {
+      currentUser = session.user;
+    } else if (event === 'SIGNED_OUT') {
       currentUser = null;
       showScreen('auth-screen');
     }
@@ -2720,11 +2763,28 @@ async function handleLogin() {
   const pass = document.getElementById('login-password').value;
   if (!email || !pass) return showAuthMsg('Please fill in all fields', 'error');
   
-  setLoading('login-btn', true);
-  const { error } = await sb.auth.signInWithPassword({ email, password: pass });
-  setLoading('login-btn', false);
+  setLoading('login-btn', true, 'Sign In');
+  const { data, error } = await sb.auth.signInWithPassword({ email, password: pass });
+  setLoading('login-btn', false, 'Sign In');
   
-  if (error) showAuthMsg(error.message, 'error');
+  if (error) {
+    if (error.message.includes('Email not confirmed') || error.message.includes('not confirmed')) {
+      showAuthMsg('Please verify your email first. Check your inbox for the verification link. <button onclick="resendVerification(\''+email+'\')" style="background:none;border:none;color:#1B3A6B;font-weight:600;cursor:pointer;text-decoration:underline;font-size:inherit;">Resend email</button>', 'error');
+    } else if (error.message.includes('Invalid login credentials')) {
+      showAuthMsg('Wrong email or password. Please try again.', 'error');
+    } else {
+      showAuthMsg(error.message, 'error');
+    }
+  }
+}
+
+async function resendVerification(email) {
+  const { error } = await sb.auth.resend({ type: 'signup', email, options: { emailRedirectTo: window.location.origin + '/' } });
+  if (error) {
+    showAuthMsg('Failed to resend: ' + error.message, 'error');
+  } else {
+    showAuthMsg('Verification email sent! Check your inbox.', 'success');
+  }
 }
 
 async function handleSignup() {
@@ -2735,16 +2795,37 @@ async function handleSignup() {
   if (!name || !email || !pass) return showAuthMsg('Please fill in all fields', 'error');
   if (pass.length < 8) return showAuthMsg('Password must be at least 8 characters', 'error');
   
-  setLoading('signup-btn', true);
+  setLoading('signup-btn', true, 'Create Account');
   const { data, error } = await sb.auth.signUp({
-    email, password: pass,
-    options: { data: { full_name: name } }
+    email: email.toLowerCase().trim(),
+    password: pass,
+    options: {
+      data: { full_name: name },
+      emailRedirectTo: window.location.origin + '/'
+    }
   });
-  setLoading('signup-btn', false);
+  setLoading('signup-btn', false, 'Create Account');
   
   if (error) {
-    showAuthMsg(error.message, 'error');
+    if (error.message.includes('already registered') || error.message.includes('already been registered')) {
+      showAuthMsg('Email already registered. Please sign in instead.', 'error');
+    } else {
+      showAuthMsg(error.message, 'error');
+    }
+    return;
+  }
+  
+  // Check if email confirmation is required
+  if (data.user && !data.user.email_confirmed_at) {
+    // Show verification message and switch to sign-in tab
+    showAuthMsg('✅ Account created! We sent a verification email to ' + email + '. Click the link in the email to verify, then sign in here.', 'success');
+    // Switch to sign-in tab after 2 seconds
+    setTimeout(() => {
+      switchAuthTab('login');
+      document.getElementById('login-email').value = email;
+    }, 2000);
   } else {
+    // Auto-confirmed (e.g., dev mode)
     showAuthMsg('Account created! Welcome to VELA 🎉', 'success');
   }
 }
@@ -2756,7 +2837,7 @@ async function handleLogout() {
 
 function showAuthMsg(msg, type) {
   const el = document.getElementById('auth-msg');
-  el.textContent = msg;
+  el.innerHTML = msg;
   el.className = 'auth-msg ' + type;
 }
 function clearAuthMsg() { document.getElementById('auth-msg').className = 'auth-msg'; }
@@ -4228,11 +4309,16 @@ function categoryIcon(cat) {
   return icons[cat] || '📦';
 }
 
-function setLoading(btnId, loading) {
+function setLoading(btnId, loading, originalText) {
   const btn = document.getElementById(btnId);
   if (!btn) return;
   btn.disabled = loading;
-  btn.textContent = loading ? 'Please wait...' : btn.textContent;
+  if (loading) {
+    btn.dataset.original = btn.textContent;
+    btn.textContent = 'Please wait...';
+  } else {
+    btn.textContent = originalText || btn.dataset.original || btn.textContent;
+  }
 }
 
 // Keyboard: Enter to submit forms
