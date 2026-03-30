@@ -167,37 +167,11 @@ svg { display: block; flex-shrink: 0; }
 }
 .powered-by span { font-weight: 600; color: var(--navy); }
 
-/* ADMIN AUTH */
+/* ADMIN AUTH — styles inlined in HTML */
 #admin-auth-screen {
   min-height: 100vh;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  background: var(--navy-dark);
-  padding: 20px;
+  background: #f5f7fa;
 }
-.admin-auth-card {
-  background: #1a2a4a;
-  border-radius: 20px;
-  padding: 40px;
-  width: 100%;
-  max-width: 380px;
-  border: 1px solid rgba(255,255,255,0.1);
-}
-.admin-auth-card h2 {
-  color: white;
-  font-size: 22px;
-  font-weight: 700;
-  margin-bottom: 6px;
-}
-.admin-auth-card p { color: rgba(255,255,255,0.5); font-size: 13px; margin-bottom: 28px; }
-.admin-auth-card .field label { color: rgba(255,255,255,0.6); }
-.admin-auth-card .field input {
-  background: rgba(255,255,255,0.08);
-  border-color: rgba(255,255,255,0.15);
-  color: white;
-}
-.admin-auth-card .field input:focus { border-color: var(--orange); background: rgba(255,255,255,0.12); }
 .admin-auth-card .btn-primary {
   background: linear-gradient(135deg, var(--orange), var(--orange-light));
   box-shadow: 0 4px 14px rgba(196,98,45,0.3);
@@ -1496,23 +1470,27 @@ tr:hover td { background: var(--bg2); }
 
 
 <!-- ADMIN AUTH -->
-<div id="admin-auth-screen" style="display:none">
-  <div class="admin-auth-card">
-    <h2>Admin Access</h2>
-    <p>VELA administration panel</p>
-    <div class="auth-form">
+<div id="admin-auth-screen" style="display:none;min-height:100vh;align-items:center;justify-content:center;background:#f5f7fa;padding:20px;">
+  <div style="background:#fff;border-radius:20px;box-shadow:0 8px 40px rgba(27,58,107,0.14);padding:40px 36px;width:100%;max-width:400px;border:1px solid #dde3ef;">
+    <div style="text-align:center;margin-bottom:28px;">
+      <div style="width:56px;height:56px;background:linear-gradient(135deg,#1B3A6B,#2a5298);border-radius:14px;display:flex;align-items:center;justify-content:center;margin:0 auto 12px;color:white;font-size:22px;font-weight:800;">A</div>
+      <div style="font-size:20px;font-weight:700;color:#1a2340;">Admin Panel</div>
+      <div style="font-size:13px;color:#8a96aa;margin-top:4px;">VELA administration access</div>
+    </div>
+    <div id="admin-auth-msg" style="display:none;background:#fef2f2;color:#ef4444;border-radius:8px;padding:10px 14px;font-size:13px;margin-bottom:16px;text-align:center;"></div>
+    <div style="display:flex;flex-direction:column;gap:14px;">
       <div class="field">
         <label>Admin Email</label>
-        <input type="email" id="admin-email" placeholder="admin@vela.grassion.com">
+        <input type="email" id="admin-email" placeholder="saisnatadash@grassion.com">
       </div>
       <div class="field">
         <label>Password</label>
-        <input type="password" id="admin-password" placeholder="••••••••">
+        <input type="password" id="admin-password" placeholder="••••••••" onkeydown="if(event.key==='Enter')handleAdminLogin()">
       </div>
-      <button class="btn-primary" onclick="handleAdminLogin()" id="admin-btn">Access Admin Panel</button>
+      <button class="btn-primary" onclick="handleAdminLogin()" id="admin-btn" style="margin-top:4px;">Access Admin Panel</button>
     </div>
-    <div style="margin-top:16px;text-align:center">
-      <button onclick="showApp()" style="background:none;color:rgba(255,255,255,0.4);font-size:13px;cursor:pointer">← Back to VELA</button>
+    <div style="margin-top:20px;text-align:center;">
+      <button onclick="window.location.hash='';showScreen('auth-screen')" style="background:none;color:#8a96aa;font-size:13px;cursor:pointer;border:none;">← Back to VELA</button>
     </div>
   </div>
 </div>
@@ -2671,6 +2649,13 @@ async function init() {
     return;
   }
 
+  // Check if admin path FIRST - before any timer so fallback can't override it
+  if (window.location.hash === '#admin') {
+    hideLoading();
+    showScreen('admin-auth-screen');
+    return;
+  }
+
   // Guaranteed fallback - ALWAYS show auth after 5 seconds no matter what
   const fallbackTimer = setTimeout(() => {
     hideLoading();
@@ -2678,15 +2663,6 @@ async function init() {
   }, 5000);
   // Show splash for at least 1.5 seconds for UX
   const splashStart = Date.now();
-  
-  // Check if admin path
-  if (window.location.hash === '#admin') {
-    setTimeout(() => {
-      hideLoading();
-      showScreen('admin-auth-screen');
-    }, 800);
-    return;
-  }
 
   try {
     const { data: { session } } = await sb.auth.getSession();
@@ -2848,27 +2824,39 @@ function clearAuthMsg() { document.getElementById('auth-msg').className = 'auth-
 async function handleAdminLogin() {
   const email = document.getElementById('admin-email').value.trim();
   const pass = document.getElementById('admin-password').value;
-  if (!email || !pass) return;
   
-  setLoading('admin-btn', true);
+  const msgEl = document.getElementById('admin-auth-msg');
+  function showAdminAuthMsg(msg) {
+    msgEl.textContent = msg;
+    msgEl.style.display = 'block';
+  }
+  msgEl.style.display = 'none';
+  
+  if (!email || !pass) return showAdminAuthMsg('Please enter email and password');
+  
+  setLoading('admin-btn', true, 'Access Admin Panel');
   const { data, error } = await sb.auth.signInWithPassword({ email, password: pass });
-  setLoading('admin-btn', false);
+  setLoading('admin-btn', false, 'Access Admin Panel');
   
   if (error || !data.user) {
-    showToast('Invalid credentials', 'error');
+    showAdminAuthMsg('Wrong email or password. Try again.');
     return;
   }
   
-  // Check if user has admin role (check metadata or email)
+  // Check admin role in profiles table
   const { data: profile } = await sb.from('profiles').select('role').eq('id', data.user.id).single();
-  if (!profile || !['admin','super_admin'].includes(profile.role)) {
-    showToast('Access denied — not an admin', 'error');
+  
+  // Also allow by email match as fallback
+  const isAdminEmail = email.toLowerCase() === 'saisnatadash@grassion.com';
+  const isAdminRole = profile && ['admin','super_admin'].includes(profile.role);
+  
+  if (!isAdminRole && !isAdminEmail) {
+    showAdminAuthMsg('Access denied. Admin accounts only.');
     await sb.auth.signOut();
     return;
   }
   
   currentUser = data.user;
-  hideLoading();
   showScreen('admin-app');
   await loadAdminData();
 }
